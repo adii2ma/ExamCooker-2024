@@ -80,8 +80,8 @@ const QuizPage = () => {
 
   const courses: Course[] = [
     { courseCode: "102104073", courseName: "Wildlife Ecology" },
-    { courseCode: "102104082 ", courseName: "Forest and Management" },
-    { courseCode: "109106067", courseName: "Spoken English" },
+    { courseCode: "102104082 ", courseName: "Forest and their Management" },
+    { courseCode: "109106067", courseName: "Better Spoken English" },
     
   ];
 
