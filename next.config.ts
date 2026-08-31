@@ -1,4 +1,7 @@
 import type { NextConfig } from "next";
+// Same constant the sync script emits asset URLs against, so the allowlist
+// below can never drift away from the host those URLs actually use.
+import { SITE_ORIGIN as VIN_TOGETHER_ORIGIN } from "./scripts/vin-together-site.js";
 
 type RemotePattern = NonNullable<NonNullable<NextConfig["images"]>["remotePatterns"]>[number];
 
@@ -82,6 +85,11 @@ const fallbackAzureBaseUrls = [
     "https://examcookerprodsi.blob.core.windows.net/exam-assets",
 ];
 
+// VInTogether course assets (topic "Visual" diagrams, PDFs) are served from
+// this origin. Without it in the allowlist next/image rejects every optimizer
+// request and diagram-only blocks render as an empty box.
+const vinTogetherRemotePattern = buildRemotePattern(VIN_TOGETHER_ORIGIN);
+
 const configuredRemotePatterns = Array.from(
     new Map(
         [configuredAzureBaseUrl, ...fallbackAzureBaseUrls]
@@ -91,9 +99,17 @@ const configuredRemotePatterns = Array.from(
     ).values(),
 ).filter((pattern): pattern is RemotePattern => pattern !== null);
 
+// Emit browser source maps only when we intend to upload them to PostHog error
+// tracking (set by the deploy workflow when the PostHog CLI secrets are present).
+// The upload step strips the `.map` files back out before packaging, so they are
+// never served publicly. Off by default, so ordinary builds are unaffected.
+const uploadSourceMaps = process.env.POSTHOG_SOURCEMAP_UPLOAD === "true";
+
 const nextConfig: NextConfig = {
     output: "standalone",
+    productionBrowserSourceMaps: uploadSourceMaps,
     cacheComponents: true,
+    partialPrefetching: true,
     compiler: {
         removeConsole:
             process.env.NODE_ENV === "production"
@@ -103,10 +119,13 @@ const nextConfig: NextConfig = {
                 : false,
     },
     experimental: {
+        instantInsights: {
+            validationLevel: "warning",
+        },
         serverActions: {
             bodySizeLimit: "10mb",
         },
-        viewTransition: true,
+        useTypeScriptCli: true,
     },
     turbopack: {
         root: __dirname,
@@ -116,7 +135,7 @@ const nextConfig: NextConfig = {
             },
         },
     },
-    serverExternalPackages: ["canvas"],
+    serverExternalPackages: ["@azure/identity", "canvas"],
     images: {
         formats: ["image/avif", "image/webp"],
         minimumCacheTTL: 60 * 60 * 24 * 30,
@@ -138,6 +157,7 @@ const nextConfig: NextConfig = {
                 hostname: "www.everything-assistant.com",
                 pathname: "/onboarding-artwork/**",
             },
+            ...(vinTogetherRemotePattern ? [vinTogetherRemotePattern] : []),
             ...configuredRemotePatterns,
         ],
     },

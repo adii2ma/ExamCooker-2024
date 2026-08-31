@@ -1,6 +1,6 @@
 import React from "react";
-import Link from "next/link";
 import Image from "@/app/components/common/app-image";
+import IntentPrefetchLink from "@/app/components/common/intent-prefetch-link";
 import { normalizeGcsUrl } from "@/lib/normalize-gcs-url";
 import { examTypeLabel } from "@/lib/exam-slug";
 import type { ExamType } from "@/db";
@@ -20,9 +20,11 @@ type RecentItem = {
 export default function RecentPaperStrip({
     items,
     title = "Recently added",
+    detailSearchString,
 }: {
     items: RecentItem[];
     title?: string;
+    detailSearchString?: string;
 }) {
     if (items.length === 0) return null;
     return (
@@ -34,13 +36,15 @@ export default function RecentPaperStrip({
             </header>
             <div className="past-papers-recent-strip flex snap-x snap-mandatory gap-3 overflow-x-auto pb-2 [&::-webkit-scrollbar]:hidden">
                 {items.map((item, i) => {
-                    const href = getPastPaperDetailPath(item.id, item.courseCode);
+                    const hrefBase = getPastPaperDetailPath(item.id, item.courseCode);
+                    const href = detailSearchString
+                        ? `${hrefBase}?${detailSearchString}`
+                        : hrefBase;
                     const thumb = normalizeGcsUrl(item.thumbNailUrl);
                     return (
-                        <Link
+                        <IntentPrefetchLink
                             key={item.id}
                             href={href}
-                            prefetch={i < 3}
                             transitionTypes={["nav-forward"]}
                             className="group relative flex w-40 shrink-0 snap-start flex-col overflow-hidden border-2 border-[#5FC4E7] bg-[#5FC4E7] text-black transition duration-200 hover:scale-[1.02] hover:border-b-white hover:shadow-xl dark:border-[#ffffff]/20 dark:bg-[#ffffff]/10 dark:text-[#D5D5D5] dark:lg:bg-[#0C1222] dark:hover:border-b-[#3BF4C7] dark:hover:bg-[#ffffff]/10 sm:w-44"
                         >
@@ -81,7 +85,7 @@ export default function RecentPaperStrip({
                                     )}
                                 </div>
                             </div>
-                        </Link>
+                        </IntentPrefetchLink>
                     );
                 })}
             </div>

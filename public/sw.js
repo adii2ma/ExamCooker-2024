@@ -1,4 +1,4 @@
-const CACHE_VERSION = "v3";
+const CACHE_VERSION = "v6";
 const STATIC_CACHE = `examcooker-static-${CACHE_VERSION}`;
 const PAGE_CACHE = `examcooker-pages-${CACHE_VERSION}`;
 const RUNTIME_CACHE = `examcooker-runtime-${CACHE_VERSION}`;
@@ -13,18 +13,26 @@ const PRECACHE_ASSETS = [
 ];
 
 const KNOWN_CACHES = new Set([STATIC_CACHE, PAGE_CACHE, RUNTIME_CACHE]);
+const EXAMCOOKER_CACHE_PREFIXES = [
+  "examcooker-static-",
+  "examcooker-pages-",
+  "examcooker-runtime-",
+];
 
 const STATIC_PATH_PREFIXES = ["/_next/static/", "/icons/", "/assets/", "/vendor/"];
 const STATIC_PATH_EXACT = new Set(["/manifest.webmanifest", "/offline.html", "/sw.js"]);
+const NO_CACHE_PATH_EXACT = new Set(["/", "/auth"]);
 const FONT_HOSTS = new Set(["fonts.googleapis.com", "fonts.gstatic.com"]);
 const NO_CACHE_PATH_PREFIXES = [
   "/api/",
   "/auth/",
+  "/vendor/embedpdf/",
   "/native-auth/",
   "/_next/data/",
   "/_next/image",
   "/signin",
   "/ecp/",
+  "/mod",
 ];
 
 function isSameOrigin(url) {
@@ -41,12 +49,19 @@ function isStaticAsset(url) {
 }
 
 function isUncacheable(url) {
-  return NO_CACHE_PATH_PREFIXES.some((prefix) => url.pathname.startsWith(prefix));
+  return (
+    NO_CACHE_PATH_EXACT.has(url.pathname) ||
+    NO_CACHE_PATH_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))
+  );
 }
 
 function isHtmlAccept(request) {
   const accept = request.headers.get("accept") || "";
   return accept.includes("text/html");
+}
+
+function isExamCookerCache(name) {
+  return EXAMCOOKER_CACHE_PREFIXES.some((prefix) => name.startsWith(prefix));
 }
 
 function isRoutePayloadRequest(request, url) {
@@ -73,7 +88,7 @@ self.addEventListener("activate", (event) => {
       const names = await caches.keys();
       const staleCacheDeletes = [];
       for (const name of names) {
-        if (!KNOWN_CACHES.has(name)) {
+        if (isExamCookerCache(name) && !KNOWN_CACHES.has(name)) {
           staleCacheDeletes.push(caches.delete(name));
         }
       }
@@ -98,14 +113,12 @@ self.addEventListener("message", (event) => {
   if (event.data.type === "PREFETCH_ROUTES" && Array.isArray(event.data.routes)) {
     event.waitUntil(
       (async () => {
-        const cache = await caches.open(PAGE_CACHE);
         for (const route of event.data.routes) {
           if (typeof route !== "string" || !route.startsWith("/")) continue;
+          const url = new URL(route, self.location.origin);
+          if (isUncacheable(url)) continue;
           try {
-            const response = await fetch(route, { credentials: "same-origin" });
-            if (response && response.ok) {
-              await cache.put(route, response.clone());
-            }
+            await fetch(route, { credentials: "same-origin" });
           } catch {
             // Prefetching is best-effort.
           }
@@ -116,15 +129,26 @@ self.addEventListener("message", (event) => {
   }
 });
 
+function isCacheableResponse(response) {
+  if (!response || !response.ok || response.type === "opaque") {
+    return false;
+  }
+
+  const cacheControl = response.headers.get("cache-control") || "";
+  if (/(^|,\s*)(no-store|no-cache|private)(\s|,|=|$)/i.test(cacheControl)) {
+    return false;
+  }
+
+  return !response.headers.has("set-cookie");
+}
+
 async function staleWhileRevalidate(event, cacheName) {
   const cache = await caches.open(cacheName);
   const cached = await cache.match(event.request, { ignoreSearch: false });
-  const preloadResponse =
-    "preloadResponse" in event ? await event.preloadResponse.catch(() => undefined) : undefined;
 
-  const networkFetch = (preloadResponse ? Promise.resolve(preloadResponse) : fetch(event.request))
+  const networkFetch = fetch(event.request)
     .then((response) => {
-      if (response && response.ok && response.type !== "opaque") {
+      if (isCacheableResponse(response)) {
         cache.put(event.request, response.clone()).catch(() => undefined);
       }
       return response;
@@ -142,10 +166,15 @@ async function staleWhileRevalidate(event, cacheName) {
   return offline || Response.error();
 }
 
-async function networkOnly(event) {
-  const preloadResponse =
-    "preloadResponse" in event ? await event.preloadResponse.catch(() => undefined) : undefined;
+function getNavigationPreload(event) {
+  if (!("preloadResponse" in event)) return null;
+  const preloadResponse = event.preloadResponse.catch(() => undefined);
+  event.waitUntil(preloadResponse.then(() => undefined));
+  return preloadResponse;
+}
 
+async function networkOnly(event, preloadResponsePromise = null) {
+  const preloadResponse = preloadResponsePromise ? await preloadResponsePromise : undefined;
   if (preloadResponse) return preloadResponse;
 
   try {
@@ -155,6 +184,13 @@ async function networkOnly(event) {
   }
 }
 
+async function networkOnlyWithOfflineFallback(event, preloadResponsePromise = null) {
+  const response = await networkOnly(event, preloadResponsePromise);
+  if (response && response.type !== "error" && response.ok) return response;
+  const offline = await caches.match("/offline.html");
+  return offline || response;
+}
+
 async function cacheFirst(event) {
   const cache = await caches.open(STATIC_CACHE);
   const cached = await cache.match(event.request);
@@ -162,7 +198,7 @@ async function cacheFirst(event) {
     event.waitUntil(
       fetch(event.request)
         .then((response) => {
-          if (response && response.ok && response.type !== "opaque") {
+          if (isCacheableResponse(response)) {
             return cache.put(event.request, response.clone());
           }
           return undefined;
@@ -173,7 +209,7 @@ async function cacheFirst(event) {
   }
   try {
     const response = await fetch(event.request);
-    if (response && response.ok && response.type !== "opaque") {
+    if (isCacheableResponse(response)) {
       cache.put(event.request, response.clone()).catch(() => undefined);
     }
     return response;
@@ -195,7 +231,9 @@ self.addEventListener("fetch", (event) => {
 
   if (request.mode === "navigate") {
     if (isUncacheable(url)) return;
-    event.respondWith(staleWhileRevalidate(event, PAGE_CACHE));
+
+    const preloadResponsePromise = getNavigationPreload(event);
+    event.respondWith(networkOnlyWithOfflineFallback(event, preloadResponsePromise));
     return;
   }
 
@@ -217,7 +255,7 @@ self.addEventListener("fetch", (event) => {
   }
 
   if (isHtmlAccept(request)) {
-    event.respondWith(staleWhileRevalidate(event, PAGE_CACHE));
+    event.respondWith(networkOnlyWithOfflineFallback(event));
     return;
   }
 

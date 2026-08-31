@@ -1,5 +1,6 @@
 import React, { Suspense } from "react";
 import type { Metadata } from "next";
+import Link from "next/link";
 import { redirect } from "next/navigation";
 import UploadButtonPaper from "@/app/components/upload-button-paper";
 import StructuredData from "@/app/components/seo/structured-data";
@@ -9,10 +10,11 @@ import SmartCourseGrid from "@/app/components/past_papers/smart-course-grid";
 import CoursePagination from "@/app/components/past_papers/course-pagination";
 import RecentPaperStrip from "@/app/components/past_papers/recent-paper-strip";
 import PastPapersCourseSearch from "@/app/components/past_papers/past-papers-course-search";
+import SearchNoResultsBeacon from "@/app/components/past_papers/search-no-results-beacon";
 import UpcomingExamsStrip from "@/app/components/past_papers/upcoming-exams-strip";
 import {
     getCatalogStats,
-    getCourseSearchRecords,
+    getSearchableCourseRecords,
     getCourseGrid,
     getRecentPapers,
     getUpcomingExamsCourseGrid,
@@ -34,6 +36,16 @@ const PAGE_SIZE = 24;
 const COURSE_GRID_CLASS =
     "past-papers-course-grid grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6";
 type PastPapersSearchParams = { search?: string; page?: string };
+const FAQ_ITEMS = [
+    {
+        question: "Where can I find VIT past papers by exam type?",
+        answer: "Use the links on this page to browse CAT-1, CAT-2, FAT, quiz, and other paper collections across all indexed courses.",
+    },
+    {
+        question: "Can I browse papers course by course?",
+        answer: "Yes. The course grid on this page links directly into a canonical paper collection for each course, with additional exam filters inside the course page.",
+    },
+];
 
 function buildSearchString(params: PastPapersSearchParams) {
     const searchParams = new URLSearchParams();
@@ -110,6 +122,25 @@ function HeroStats({
                             ·
                         </span>
                     )}
+                </div>
+            ))}
+        </div>
+    );
+}
+
+function HeroStatsShell() {
+    return (
+        <div
+            className="past-papers-hero-stats grid grid-cols-3 gap-2 sm:flex sm:flex-wrap sm:gap-x-5 sm:gap-y-1"
+            aria-hidden="true"
+        >
+            {Array.from({ length: 3 }).map((_, index) => (
+                <div
+                    key={index}
+                    className="flex min-w-0 flex-col items-start gap-1 sm:flex-row sm:items-baseline sm:gap-1.5"
+                >
+                    <span className="block h-7 w-12 bg-black/10 dark:bg-white/10 sm:h-5" />
+                    <span className="block h-2.5 w-14 bg-black/10 dark:bg-white/10 sm:h-3" />
                 </div>
             ))}
         </div>
@@ -285,12 +316,31 @@ async function CourseGridSection({
 
     if (courses.length === 0) {
         return (
-            <div className="border-2 border-dashed border-black/30 p-10 text-center dark:border-[#D5D5D5]/30">
-                <p className="text-sm text-black/70 dark:text-[#D5D5D5]/70">
-                    {search
-                        ? `No courses match "${search}".`
-                        : "No courses with papers or notes yet."}
-                </p>
+            <div className="flex flex-col gap-8 sm:gap-10">
+                {search && <SearchNoResultsBeacon query={search} />}
+                <div className="flex flex-col items-center gap-4 border-2 border-dashed border-black/30 p-10 text-center dark:border-[#D5D5D5]/30">
+                    <p className="text-sm text-black/70 dark:text-[#D5D5D5]/70">
+                        {search
+                            ? `No courses match "${search}".`
+                            : "No courses with papers or notes yet."}
+                    </p>
+                    {search && (
+                        <Link
+                            href="/past_papers"
+                            className="inline-flex items-center border-2 border-black bg-[#5FC4E7] px-4 py-2 text-sm font-bold uppercase tracking-wide text-black transition hover:bg-[#3BF4C7] dark:border-[#3BF4C7] dark:bg-[#3BF4C7]/20 dark:text-[#3BF4C7] dark:hover:bg-[#3BF4C7]/30"
+                        >
+                            Clear search
+                        </Link>
+                    )}
+                </div>
+
+                {/* Never strip everything browsable away at the one moment the
+                    search has nothing to offer — keep upcoming exams in reach. */}
+                {search && (
+                    <Suspense fallback={<PopularCoursesShell count={6} />}>
+                        <PopularCoursesSection />
+                    </Suspense>
+                )}
             </div>
         );
     }
@@ -346,7 +396,7 @@ function SearchControls({
     searchable,
 }: {
     search: string;
-    searchable: Awaited<ReturnType<typeof getCourseSearchRecords>>;
+    searchable: Awaited<ReturnType<typeof getSearchableCourseRecords>>;
 }) {
     return (
         <div className="past-papers-search-controls flex w-full items-stretch gap-2 sm:gap-3">
@@ -386,13 +436,27 @@ function DynamicHomeSectionsShell({ popularCount }: { popularCount: number }) {
     );
 }
 
+function PastPapersContentShell() {
+    return (
+        <>
+            <section className="flex flex-col gap-5">
+                <h1 className="past-papers-home-title text-[1.35rem] font-black leading-none text-black dark:text-[#D5D5D5] min-[360px]:text-[1.45rem] min-[400px]:text-2xl sm:text-5xl lg:text-6xl">
+                    Every paper. <GradientText>Every course.</GradientText>
+                </h1>
+                <HeroStatsShell />
+            </section>
+            <DynamicHomeSectionsShell popularCount={6} />
+        </>
+    );
+}
+
 async function DynamicHomeSections({
     searchParamsPromise,
     searchable,
     popularCount,
 }: {
     searchParamsPromise: Promise<PastPapersSearchParams> | undefined;
-    searchable: Awaited<ReturnType<typeof getCourseSearchRecords>>;
+    searchable: Awaited<ReturnType<typeof getSearchableCourseRecords>>;
     popularCount: number;
 }) {
     const params = (await searchParamsPromise) ?? {};
@@ -423,27 +487,43 @@ async function DynamicHomeSections({
     );
 }
 
-export default async function PastPapersPage({
+async function PastPapersContent({
     searchParams,
 }: {
     searchParams?: Promise<PastPapersSearchParams>;
 }) {
     const [stats, searchable, popularCount] = await Promise.all([
         getCatalogStats(),
-        getCourseSearchRecords(),
+        getSearchableCourseRecords(),
         getUpcomingExamsCourseGridCount(),
     ]);
-    const faq = [
-        {
-            question: "Where can I find VIT past papers by exam type?",
-            answer: "Use the links on this page to browse CAT-1, CAT-2, FAT, quiz, and other paper collections across all indexed courses.",
-        },
-        {
-            question: "Can I browse papers course by course?",
-            answer: "Yes. The course grid on this page links directly into a canonical paper collection for each course, with additional exam filters inside the course page.",
-        },
-    ];
 
+    return (
+        <>
+            <section className="flex flex-col gap-5">
+                <h1 className="past-papers-home-title text-[1.35rem] font-black leading-none text-black dark:text-[#D5D5D5] min-[360px]:text-[1.45rem] min-[400px]:text-2xl sm:text-5xl lg:text-6xl">
+                    Every paper. <GradientText>Every course.</GradientText>
+                </h1>
+
+                <HeroStats stats={stats} />
+            </section>
+
+            <Suspense fallback={<DynamicHomeSectionsShell popularCount={popularCount} />}>
+                <DynamicHomeSections
+                    searchParamsPromise={searchParams}
+                    searchable={searchable}
+                    popularCount={popularCount}
+                />
+            </Suspense>
+        </>
+    );
+}
+
+export default function PastPapersPage({
+    searchParams,
+}: {
+    searchParams?: Promise<PastPapersSearchParams>;
+}) {
     return (
         <DirectionalTransition>
             <div className="min-h-screen bg-[#C2E6EC] text-black dark:bg-[hsl(224,48%,9%)] dark:text-[#D5D5D5]">
@@ -457,29 +537,16 @@ export default async function PastPapersPage({
                             keywords: DEFAULT_KEYWORDS,
                             about: "VIT past papers",
                         }),
-                        buildFaqPage(faq),
+                        buildFaqPage(FAQ_ITEMS),
                     ]}
                 />
                 <div className="past-papers-home-shell mx-auto flex w-full max-w-7xl flex-col gap-8 px-3 py-6 sm:gap-10 sm:px-6 sm:py-8 lg:px-10 lg:py-12">
-                    <section className="flex flex-col gap-5">
-                        <h1 className="past-papers-home-title text-[1.35rem] font-black leading-none text-black dark:text-[#D5D5D5] min-[360px]:text-[1.45rem] min-[400px]:text-2xl sm:text-5xl lg:text-6xl">
-                            Every paper.{" "}
-                            <GradientText>Every course.</GradientText>
-                        </h1>
-
-                        <HeroStats stats={stats} />
-                    </section>
-
-                    <Suspense fallback={<DynamicHomeSectionsShell popularCount={popularCount} />}>
-                        <DynamicHomeSections
-                            searchParamsPromise={searchParams}
-                            searchable={searchable}
-                            popularCount={popularCount}
-                        />
+                    <Suspense fallback={<PastPapersContentShell />}>
+                        <PastPapersContent searchParams={searchParams} />
                     </Suspense>
 
                     <section className="sr-only">
-                        {faq.map((item) => (
+                        {FAQ_ITEMS.map((item) => (
                             <article
                                 key={item.question}
                                 className="rounded-md border border-black/10 bg-white p-4 dark:border-[#D5D5D5]/10 dark:bg-[#0C1222]"

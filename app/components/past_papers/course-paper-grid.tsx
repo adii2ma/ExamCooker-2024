@@ -2,6 +2,7 @@
 
 import React, { ViewTransition, useCallback, useEffect, useEffectEvent, useMemo, useReducer, useRef } from "react";
 import { createPortal } from "react-dom";
+import { useRouter } from "next/navigation";
 import {
     Check,
     Download,
@@ -21,6 +22,11 @@ import {
 } from "@/lib/downloads/resource-names";
 import { examTypeLabel } from "@/lib/exam-slug";
 import {
+    captureBulkPapersDownloadCompleted,
+    captureBulkPapersDownloadFailed,
+    captureBulkPapersDownloadStarted,
+} from "@/lib/posthog/client";
+import {
     usePaperSplitView,
     type PaperSplitItem,
     type PaperSplitSide,
@@ -29,11 +35,13 @@ import {
     DESKTOP_SELECT_ALL_HOST_ID,
     MOBILE_SELECT_ALL_HOST_ID,
 } from "./course-paper-grid-controls";
+import { getPastPaperDetailPath } from "@/lib/seo";
 
 type Props = {
     papers: CoursePaperListItem[];
     courseCode: string;
     courseTitle: string;
+    detailSearchString?: string;
 };
 
 const WIDE_STRETCH_CLASS_BY_REMAINDER: Partial<Record<number, string>> = {
@@ -175,7 +183,9 @@ export default function CoursePaperGrid({
     papers,
     courseCode,
     courseTitle,
+    detailSearchString,
 }: Props) {
+    const router = useRouter();
     const [{ contextMenu, isDownloading, portalReady, selected, splitDrag }, dispatch] =
         useReducer(coursePaperGridReducer, initialCoursePaperGridState);
     const splitDragPaperRef = useRef<CoursePaperListItem | null>(null);
@@ -216,8 +226,12 @@ export default function CoursePaperGrid({
         if (!selectedPapers.length) return;
 
         dispatch({ type: "downloading", value: true });
+        captureBulkPapersDownloadStarted({
+            courseCode,
+            fileCount: selectedPapers.length,
+        });
         try {
-            await downloadPdfZip({
+            const result = await downloadPdfZip({
                 zipFileName: buildPastPaperZipFileName({ courseCode, courseTitle }),
                 files: selectedPapers.map((paper) => ({
                     fileUrl: paper.fileUrl,
@@ -230,9 +244,35 @@ export default function CoursePaperGrid({
                         year: paper.year,
                         hasAnswerKey: paper.hasAnswerKey,
                     }),
+                    pageEdits: paper.pageEdits,
                 })),
             });
-        } catch {
+
+            captureBulkPapersDownloadCompleted({
+                courseCode,
+                requested: result.requested,
+                succeeded: result.succeeded,
+                failed: result.failed.length,
+            });
+
+            if (result.failed.length > 0) {
+                toast({
+                    title: `Downloaded ${result.succeeded} of ${result.requested} papers.`,
+                    description:
+                        "Some papers could not be fetched and were skipped from the zip.",
+                });
+            } else {
+                toast({
+                    title: `Downloaded ${result.succeeded} ${result.succeeded === 1 ? "paper" : "papers"}.`,
+                });
+            }
+        } catch (error) {
+            captureBulkPapersDownloadFailed({
+                courseCode,
+                requested: selectedPapers.length,
+                errorMessage:
+                    error instanceof Error ? error.message : "Unknown error",
+            });
             toast({
                 title: "Could not create the zip file.",
                 variant: "destructive",
@@ -256,15 +296,24 @@ export default function CoursePaperGrid({
         [courseCode, courseTitle],
     );
 
+    const getPaperPageHref = useCallback(
+        (paper: CoursePaperListItem) => {
+            const href = getPastPaperDetailPath(paper.id, courseCode);
+            return detailSearchString ? `${href}?${detailSearchString}` : href;
+        },
+        [courseCode, detailSearchString],
+    );
+
     const buildSplitPaper = useCallback(
         (paper: CoursePaperListItem): PaperSplitItem => ({
             id: paper.id,
             title: paper.title,
-            href: `/past_papers/${encodeURIComponent(courseCode)}/paper/${paper.id}`,
+            href: getPaperPageHref(paper),
             fileUrl: paper.fileUrl,
             fileName: getPaperFileName(paper),
             courseCode,
             courseTitle,
+            pageEdits: paper.pageEdits,
             meta: [
                 paper.examType ? examTypeLabel(paper.examType) : null,
                 paper.slot,
@@ -272,7 +321,7 @@ export default function CoursePaperGrid({
                 paper.hasAnswerKey ? "Answer key" : null,
             ].filter((value): value is string => Boolean(value)),
         }),
-        [courseCode, courseTitle, getPaperFileName],
+        [courseCode, courseTitle, getPaperFileName, getPaperPageHref],
     );
 
     const getSplitSideForPoint = useCallback((x: number): PaperSplitSide | null => {
@@ -290,6 +339,7 @@ export default function CoursePaperGrid({
 
     const openContextMenu = useCallback(
         (paper: CoursePaperListItem, point: { x: number; y: number }) => {
+            router.prefetch(getPaperPageHref(paper));
             dispatch({
                 type: "context-menu",
                 contextMenu: {
@@ -298,13 +348,13 @@ export default function CoursePaperGrid({
                 },
             });
         },
-        [],
+        [getPaperPageHref, router],
     );
 
     const openPaperPage = useCallback((paper: CoursePaperListItem) => {
-        window.location.assign(`/past_papers/${encodeURIComponent(courseCode)}/paper/${paper.id}`);
+        router.push(getPaperPageHref(paper));
         closeContextMenu();
-    }, [closeContextMenu, courseCode]);
+    }, [closeContextMenu, getPaperPageHref, router]);
 
     const openPdfInNewTab = useCallback((paper: CoursePaperListItem) => {
         window.open(paper.fileUrl, "_blank", "noopener,noreferrer");
@@ -315,6 +365,7 @@ export default function CoursePaperGrid({
         void downloadPdfFile({
             fileUrl: paper.fileUrl,
             fileName: getPaperFileName(paper),
+            pageEdits: paper.pageEdits,
         });
         closeContextMenu();
     }, [closeContextMenu, getPaperFileName]);
@@ -641,6 +692,7 @@ export default function CoursePaperGrid({
                                 paper={paper}
                                 courseCode={courseCode}
                                 courseTitle={courseTitle}
+                                href={getPaperPageHref(paper)}
                                 index={index}
                                 selected={selected.has(paper.id)}
                                 onToggleSelect={toggle}
@@ -670,16 +722,20 @@ export default function CoursePaperGrid({
                             type="button"
                             onClick={downloadSelected}
                             disabled={isDownloading}
-                            className="inline-flex h-8 items-center gap-1.5 rounded border border-black/20 bg-[#5FC4E7]/90 px-3 text-xs font-semibold text-black transition hover:bg-[#5FC4E7] dark:border-[#3BF4C7]/40 dark:bg-[#3BF4C7]/20 dark:text-[#3BF4C7] dark:hover:bg-[#3BF4C7]/30 sm:text-sm"
+                            className="inline-flex h-8 items-center gap-1.5 rounded border border-black/20 bg-[#5FC4E7]/90 px-3 text-xs font-semibold text-black transition hover:bg-[#5FC4E7] disabled:cursor-not-allowed disabled:opacity-70 dark:border-[#3BF4C7]/40 dark:bg-[#3BF4C7]/20 dark:text-[#3BF4C7] dark:hover:bg-[#3BF4C7]/30 sm:text-sm"
                         >
                             <Download className="size-3.5" aria-hidden />
                             {isDownloading ? "Zipping..." : "Download"}
                         </button>
+                        <span
+                            aria-hidden
+                            className="ml-1 h-5 w-px bg-black/10 dark:bg-[#D5D5D5]/15"
+                        />
                         <button
                             type="button"
                             onClick={clear}
                             aria-label="Clear selection"
-                            className="inline-flex size-8 items-center justify-center rounded text-black/50 transition hover:bg-black/5 hover:text-black dark:text-[#D5D5D5]/50 dark:hover:bg-white/5 dark:hover:text-[#D5D5D5]"
+                            className="ml-1 inline-flex size-8 items-center justify-center rounded text-black/50 transition hover:bg-black/5 hover:text-black dark:text-[#D5D5D5]/50 dark:hover:bg-white/5 dark:hover:text-[#D5D5D5]"
                         >
                             <X className="size-3.5" aria-hidden />
                         </button>

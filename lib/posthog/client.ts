@@ -3,12 +3,14 @@ import {
     getPostHogClientConfig,
     getPostHogProjectKey,
 } from "@/lib/posthog/shared";
+import { toRouteTemplate } from "@/lib/posthog/route-template";
 import { captureVoiceRealtimeAnalyticsAction } from "@/app/components/voice/voice-agent-actions";
 
 export type VoiceAgentEntryPoint = "nav" | "home_search";
-export type CourseSearchContext = "home" | "notes" | "past_papers";
+export type CourseSearchContext = "home" | "notes" | "past_papers" | "syllabus";
 export type CourseSearchInteraction =
     | "click"
+    | "download"
     | "keyboard"
     | "mobile_tap"
     | "submit_exact_match";
@@ -99,9 +101,30 @@ function capturePostHogEvent(
     properties?: AnalyticsProperties,
     options?: CaptureOptions,
 ) {
+    const loadedClient = getLoadedClient();
+    if (loadedClient) {
+        try {
+            loadedClient.capture(event, properties, options);
+        } catch {
+            // Analytics must never interrupt the user action being measured.
+        }
+        return;
+    }
+
     void initializePostHogClient()
         .then((client) => {
             client?.capture(event, properties, options);
+        })
+        .catch(() => undefined);
+}
+
+function capturePostHogException(
+    error: Error,
+    properties?: AnalyticsProperties,
+) {
+    void initializePostHogClient()
+        .then((client) => {
+            client?.captureException(error, properties);
         })
         .catch(() => undefined);
 }
@@ -114,6 +137,48 @@ function getQueryMetrics(query: string) {
         query_length: trimmedQuery.length,
         query_word_count: queryTerms.length,
     };
+}
+
+const COURSE_SEARCH_NO_RESULTS_DEDUPE_MS = 5_000;
+const recentCourseSearchNoResults = new Map<string, number>();
+
+function getCourseSearchNoResultsKey(
+    context: CourseSearchContext,
+    query: string,
+) {
+    return `${context}:${query.toLocaleLowerCase()}`;
+}
+
+function readLastCourseSearchNoResultsAt(key: string) {
+    const inMemory = recentCourseSearchNoResults.get(key);
+    if (typeof window === "undefined") return inMemory;
+
+    try {
+        const stored = window.sessionStorage.getItem(
+            `examcooker:course-search-no-results:${key}`,
+        );
+        const parsed = stored ? Number(stored) : Number.NaN;
+        return Number.isFinite(parsed)
+            ? Math.max(inMemory ?? 0, parsed)
+            : inMemory;
+    } catch {
+        return inMemory;
+    }
+}
+
+function recordCourseSearchNoResultsAt(key: string, capturedAt: number) {
+    recentCourseSearchNoResults.set(key, capturedAt);
+    if (typeof window === "undefined") return;
+
+    try {
+        window.sessionStorage.setItem(
+            `examcooker:course-search-no-results:${key}`,
+            String(capturedAt),
+        );
+    } catch {
+        // Storage can be unavailable in private browsing. The in-memory marker
+        // still deduplicates captures during the current page lifetime.
+    }
 }
 
 function getSessionDurationMs(startedAt: number | null) {
@@ -167,6 +232,74 @@ export function captureCourseSearchSubmitted(input: {
         result_count: input.resultCount,
         exact_match_found: input.exactMatchFound,
         ...getQueryMetrics(input.query),
+    });
+}
+
+export function captureCourseSearchNoResults(input: {
+    context: CourseSearchContext;
+    query: string;
+}) {
+    const trimmedQuery = input.query.trim();
+    if (!trimmedQuery) return;
+
+    const dedupeKey = getCourseSearchNoResultsKey(input.context, trimmedQuery);
+    const capturedAt = Date.now();
+    const previousCaptureAt = readLastCourseSearchNoResultsAt(dedupeKey);
+    if (
+        previousCaptureAt !== undefined &&
+        capturedAt - previousCaptureAt < COURSE_SEARCH_NO_RESULTS_DEDUPE_MS
+    ) {
+        return;
+    }
+    recordCourseSearchNoResultsAt(dedupeKey, capturedAt);
+
+    // Capture the raw query so we can finally see what people search for and
+    // don't find. Failed searches while typing previously fired nothing, and
+    // the query text was never in the taxonomy, so the true zero-result volume
+    // was undercounted.
+    capturePostHogEvent("course_search_no_results", {
+        search_context: input.context,
+        search_query: trimmedQuery.slice(0, 200),
+        ...getQueryMetrics(trimmedQuery),
+    });
+}
+
+export function captureCourseSearchAbandoned(input: {
+    context: CourseSearchContext;
+    query: string;
+    resultCount: number;
+}) {
+    const trimmedQuery = input.query.trim();
+    if (!trimmedQuery) return;
+
+    // A search that returned rows but never got a click is otherwise invisible:
+    // `course_search_no_results` only covers empty results, so a session that
+    // matched on every query yet never opened a result (the exact pattern seen
+    // in the syllabus recordings) would leave no trace. sendBeacon because this
+    // fires as the user leaves the search — on clear, unmount, or page unload.
+    capturePostHogEvent(
+        "course_search_abandoned",
+        {
+            search_context: input.context,
+            search_query: trimmedQuery.slice(0, 200),
+            result_count: input.resultCount,
+            ...getQueryMetrics(trimmedQuery),
+        },
+        { transport: "sendBeacon" },
+    );
+}
+
+export function captureCourseSearchFocused(input: {
+    context: CourseSearchContext;
+    suggestionCount: number;
+}) {
+    // Fired when someone focuses the search field without having typed anything.
+    // This dead-ends silently in session replay otherwise (the empty-focus case
+    // used to render nothing and emit no event), so capture it to size how many
+    // people open search, see the suggested courses, and where they go next.
+    capturePostHogEvent("course_search_focused", {
+        search_context: input.context,
+        suggestion_count: input.suggestionCount,
     });
 }
 
@@ -367,12 +500,360 @@ export function captureQuizSubmitted(input: {
     });
 }
 
+export type PdfPageRenderFailureReason =
+    | "render_error"
+    | "render_timeout"
+    | "render_stalled"
+    | "empty_blob"
+    | "image_decode";
+
+export function capturePdfPageRenderFailed(input: {
+    documentId: string;
+    pageIndex: number;
+    reason: PdfPageRenderFailureReason;
+    timeoutMs?: number;
+    errorMessage?: string | null;
+}) {
+    const properties: AnalyticsProperties = {
+        // Keep the document ID and page number for drill-down, but note they are
+        // deliberately NOT part of the exception message below.
+        pdf_document_id: input.documentId,
+        pdf_page_index: input.pageIndex,
+        pdf_page_number: input.pageIndex + 1,
+        failure_reason: input.reason,
+        timeout_ms: input.timeoutMs,
+        error_message: input.errorMessage?.slice(0, 500),
+        // Pin every page-render failure to a single Error Tracking issue. Baking
+        // the concrete document ID and page number into the message previously
+        // minted a brand-new issue — and a duplicate "new issue" alert — for
+        // every document/page combination, so a real regression spanning many
+        // documents would arrive as dozens of one-occurrence issues instead of
+        // one with a true occurrence count. The `failure_reason` property keeps
+        // the render_error/timeout/stalled/empty_blob/image_decode split for
+        // drill-down.
+        $exception_fingerprint: "PdfPageRenderError",
+    };
+
+    // Custom event so the blank-viewer failure rate is measurable in funnels
+    // and dashboards alongside the `content_viewed` event.
+    capturePostHogEvent("pdf_page_render_failed", properties);
+
+    // Also surface it as a `$exception` in Error Tracking. The render catch
+    // previously only `console.error`-ed, so these failures never reached
+    // PostHog and the true failure rate was invisible. The message stays free of
+    // the per-document/page identifiers (they live on the properties above) so
+    // the pinned fingerprint collapses all occurrences into one issue.
+    const error = new Error(`PDF page render ${input.reason}`);
+    error.name = "PdfPageRenderError";
+    capturePostHogException(error, properties);
+}
+
+export type PdfDocumentLoadFailureReason =
+    | "load_timeout"
+    | "load_error"
+    | "empty_buffer";
+
+export function capturePdfDocumentLoadFailed(input: {
+    documentId?: string | null;
+    reason: PdfDocumentLoadFailureReason;
+    timeoutMs?: number;
+    loadingProgress?: number | null;
+    errorMessage?: string | null;
+    // pdfium's `PdfErrorCode` for the underlying rejection (e.g. WrongFormat,
+    // NotFound) so a load failure says what pdfium refused, not just that it did.
+    errorCode?: number | null;
+}) {
+    const properties: AnalyticsProperties = {
+        // Keep the document ID for drill-down when PDFium created one, but note
+        // it is deliberately NOT part of the exception message below. An empty
+        // downloaded buffer fails before a document ID exists.
+        pdf_document_id: input.documentId ?? undefined,
+        failure_reason: input.reason,
+        timeout_ms: input.timeoutMs,
+        loading_progress:
+            typeof input.loadingProgress === "number"
+                ? Math.round(input.loadingProgress)
+                : undefined,
+        error_message: input.errorMessage?.slice(0, 500),
+        error_code:
+            typeof input.errorCode === "number" ? input.errorCode : undefined,
+        // Pin every document-load failure to a single Error Tracking issue,
+        // mirroring the page-render path. The concrete document ID in the
+        // message previously fragmented one failure class into a fresh issue —
+        // and a duplicate "new issue" alert — per document.
+        $exception_fingerprint: "PdfDocumentLoadError",
+    };
+
+    // Custom event so the silent "Loading PDF…" placeholder failure rate is
+    // measurable alongside `content_viewed`. The document-load phase previously
+    // had no timeout and emitted no telemetry, so a stalled buffer left the
+    // viewer on the placeholder forever with nothing captured — the sibling of
+    // `pdf_page_render_failed`, but for the load phase instead of the render one.
+    capturePostHogEvent("pdf_document_load_failed", properties);
+
+    // Also surface it as a `$exception` in Error Tracking, matching the
+    // page-render failure path, so document-load stalls show up alongside
+    // other client errors with the load context attached. The message stays
+    // free of the per-document identifier (it lives on the properties above) so
+    // the pinned fingerprint collapses all occurrences into one issue.
+    const error = new Error(`PDF document load ${input.reason}`);
+    error.name = "PdfDocumentLoadError";
+    capturePostHogException(error, properties);
+}
+
+export type PdfEngineLoadFailureReason = "engine_error" | "engine_timeout";
+
+export function capturePdfEngineLoadFailed(input: {
+    fileUrl: string;
+    reason: PdfEngineLoadFailureReason;
+    timeoutMs?: number;
+    errorMessage?: string | null;
+}) {
+    const properties: AnalyticsProperties = {
+        // No document ID exists yet — pdfium has not opened anything; the engine
+        // itself failed to start. Key on the file URL for drill-down instead.
+        file_url: input.fileUrl,
+        failure_reason: input.reason,
+        timeout_ms: input.timeoutMs,
+        error_message: input.errorMessage?.slice(0, 500),
+        // Pin every engine-start failure to a single Error Tracking issue,
+        // mirroring the document-load and page-render paths.
+        $exception_fingerprint: "PdfEngineLoadError",
+    };
+
+    // Custom event so the "Loading PDF engine" placeholder failure rate is
+    // measurable alongside `content_viewed`. This phase previously had no
+    // timeout and emitted no telemetry, so a hung `createPdfiumEngine` left the
+    // viewer blank forever with nothing captured.
+    capturePostHogEvent("pdf_engine_load_failed", properties);
+
+    // Also surface it as a `$exception` so engine-start stalls show up in Error
+    // Tracking. The message stays free of the per-file identifier (it lives on
+    // the properties above) so the pinned fingerprint collapses occurrences.
+    const error = new Error(`PDF engine load ${input.reason}`);
+    error.name = "PdfEngineLoadError";
+    capturePostHogException(error, properties);
+}
+
+export function capturePdfBufferLoadFailed(input: {
+    fileUrl: string;
+    errorMessage?: string | null;
+}) {
+    const properties: AnalyticsProperties = {
+        file_url: input.fileUrl,
+        failure_reason: "buffer_error",
+        error_message: input.errorMessage?.slice(0, 500),
+        // Pin every buffer-download failure to a single Error Tracking issue.
+        $exception_fingerprint: "PdfBufferLoadError",
+    };
+
+    // Custom event so the "Downloading PDF" phase failure rate is measurable.
+    // The buffer-download error branch previously rendered its `ErrorState`
+    // without a single capture, so a failed download looked identical to a
+    // successful render in analytics.
+    capturePostHogEvent("pdf_buffer_load_failed", properties);
+
+    const error = new Error("PDF buffer download failed");
+    error.name = "PdfBufferLoadError";
+    capturePostHogException(error, properties);
+}
+
+export function capturePdfViewerRendered(input: {
+    documentId: string;
+    fileUrl: string;
+    totalPages?: number | null;
+}) {
+    // The success counterpart the viewer never had. Without it a perfectly
+    // rendered PDF and a silently blank viewer looked identical in analytics —
+    // both emitted `content_viewed` and nothing else. Fired once per document,
+    // when the first page actually paints, this is the denominator that turns
+    // the blank-viewer rate into a number we can watch alongside the
+    // `pdf_engine_load_failed` / `pdf_buffer_load_failed` /
+    // `pdf_document_load_failed` / `pdf_page_render_failed` events.
+    capturePostHogEvent("pdf_viewer_rendered", {
+        pdf_document_id: input.documentId,
+        file_url: input.fileUrl,
+        pdf_total_pages:
+            typeof input.totalPages === "number" ? input.totalPages : undefined,
+    });
+}
+
+export function captureHydrationMismatchRecovered(input: {
+    path: string;
+    reactErrorNumber: number | null;
+    errorMessage?: string | null;
+    reloadTriggered: boolean;
+}) {
+    const safePath = input.path.split(/[?#]/, 1)[0] || "/";
+    const routeTemplate = toRouteTemplate(safePath);
+    const properties: AnalyticsProperties = {
+        // Keep the full (query/fragment-stripped) path for drill-down, but note
+        // it is deliberately NOT part of the exception message below.
+        path: safePath,
+        route: routeTemplate,
+        react_error_number: input.reactErrorNumber,
+        error_message: input.errorMessage?.slice(0, 500),
+        reload_triggered: input.reloadTriggered,
+        // Pin every hydration-recovery incident to a single Error Tracking
+        // issue. Baking the concrete path (with its resource CUID) into the
+        // message previously minted a brand-new issue — and a duplicate
+        // "new issue" alert — for every newly visited note/paper/syllabus page.
+        // A constant fingerprint also stops React #418-vs-#419 and
+        // reloaded-vs-not from splitting the same underlying bug.
+        $exception_fingerprint: "HydrationMismatchRecovered",
+    };
+
+    // Detection and the guarded reload happen in an inline `beforeInteractive`
+    // script (see `app/layout.tsx`); this only reports the recorded incident
+    // once the page is stable (after any reload has already completed), so the
+    // capture never races the navigation that would otherwise drop it.
+
+    // Custom event so hydration-driven blank viewers are measurable in funnels
+    // and dashboards. The failing sessions emit no `pdf_page_render_failed`
+    // (the failure never reaches the render catch) and, until now, nothing that
+    // pinpointed a hydration mismatch — so the true rate was undercounted.
+    capturePostHogEvent("hydration_mismatch_recovered", properties);
+
+    // Also surface it as a `$exception` in Error Tracking so it shows up
+    // alongside other client errors with the recovery context attached.
+    const error = new Error(
+        `Hydration mismatch recovered${
+            input.reactErrorNumber ? ` (React #${input.reactErrorNumber})` : ""
+        } on ${routeTemplate}${input.reloadTriggered ? " — reloaded" : ""}`,
+    );
+    error.name = "HydrationMismatchRecovered";
+    capturePostHogException(error, properties);
+}
+
 export function capturePdfDownloaded(input: {
     fileName: string;
     fileUrl: string;
+    totalPages?: number | null;
+    rendered?: boolean | null;
+    viewMode?: "paper" | "pdf" | null;
 }) {
     capturePostHogEvent("pdf_downloaded", {
         file_name: input.fileName,
         file_url: input.fileUrl,
+        // In PDF mode, `pdf_rendered: false` means this specific viewer never
+        // painted a page. Questions view deliberately omits that flag and uses
+        // `pdf_view_mode: "paper"`, so an intentional non-PDF view is not
+        // misclassified as a blank viewer. `pdf_total_pages` adds paging context.
+        pdf_total_pages:
+            typeof input.totalPages === "number" ? input.totalPages : undefined,
+        pdf_rendered:
+            typeof input.rendered === "boolean" ? input.rendered : undefined,
+        pdf_view_mode: input.viewMode ?? undefined,
+    });
+}
+
+export type PdfOriginalOpenContext =
+    | "engine_load_error"
+    | "engine_load_timeout"
+    | "buffer_load_error"
+    | "document_load_stall"
+    | "document_load_timeout"
+    | "document_load_error";
+
+export function capturePdfOriginalOpened(input: {
+    context: PdfOriginalOpenContext;
+    // Absent for the engine-start and buffer-download phases: pdfium has not
+    // opened a document yet, so there is no document ID to attach.
+    documentId?: string | null;
+    fileUrl: string;
+    loadingProgress?: number | null;
+}) {
+    capturePostHogEvent("pdf_original_opened", {
+        file_url: input.fileUrl,
+        pdf_document_id: input.documentId ?? undefined,
+        viewer_phase: input.context,
+        loading_progress:
+            typeof input.loadingProgress === "number"
+                ? Math.round(input.loadingProgress)
+                : undefined,
+        // The document has not reached the page-rendering phase in any of these
+        // contexts. Keep the workaround event directly queryable alongside the
+        // toolbar download telemetry without mislabeling this click as a download.
+        pdf_rendered: false,
+    });
+}
+
+export function captureBulkPapersDownloadStarted(input: {
+    courseCode: string;
+    fileCount: number;
+}) {
+    capturePostHogEvent("bulk_papers_download_started", {
+        course_code: input.courseCode,
+        file_count: input.fileCount,
+    });
+}
+
+export function captureBulkPapersDownloadCompleted(input: {
+    courseCode: string;
+    requested: number;
+    succeeded: number;
+    failed: number;
+}) {
+    capturePostHogEvent("bulk_papers_download_completed", {
+        course_code: input.courseCode,
+        requested: input.requested,
+        succeeded: input.succeeded,
+        failed: input.failed,
+        partial: input.failed > 0,
+    });
+}
+
+export type InlineVideoFailureTrigger = "watchdog" | "player_error";
+
+export function captureInlineVideoLoadFailed(input: {
+    videoId: string;
+    trigger: InlineVideoFailureTrigger;
+    autoplay: boolean;
+    attempt: number;
+}) {
+    // The inline YouTube player surfaced "This video didn't load" with no
+    // telemetry, so the true failure rate was invisible and both this and the
+    // sibling image break reached us only through session recordings. `trigger`
+    // separates a real react-player `onError` from a watchdog timeout (a slow
+    // load we gave up on), and `attempt` shows how many retries preceded it.
+    capturePostHogEvent("inline_video_load_failed", {
+        video_id: input.videoId,
+        trigger: input.trigger,
+        autoplay: input.autoplay,
+        attempt: input.attempt,
+    });
+}
+
+export function captureResourceVisualFailed(input: {
+    imageUrl: string;
+    context: "notes" | "practice";
+}) {
+    let imageHost: string | undefined;
+
+    try {
+        imageHost = new URL(input.imageUrl).host;
+    } catch {
+        imageHost = undefined;
+    }
+
+    // Topic "Visual" diagrams silently collapsed to an empty box when the host
+    // wasn't allowlisted for next/image. Capturing the failure keeps the
+    // now-degraded-to-placeholder case measurable instead of invisible.
+    capturePostHogEvent("resource_visual_failed", {
+        image_host: imageHost,
+        image_url: input.imageUrl,
+        visual_context: input.context,
+    });
+}
+
+export function captureBulkPapersDownloadFailed(input: {
+    courseCode: string;
+    requested: number;
+    errorMessage: string;
+}) {
+    capturePostHogEvent("bulk_papers_download_failed", {
+        course_code: input.courseCode,
+        requested: input.requested,
+        error_message: input.errorMessage.slice(0, 200),
     });
 }

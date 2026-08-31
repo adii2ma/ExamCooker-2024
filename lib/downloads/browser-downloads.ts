@@ -9,10 +9,13 @@ import {
     canUseNativeFileDownload,
     shareBlobWithNativeDownloads,
 } from "@/lib/native-downloads";
+import { applyPdfPageEditsToBuffer, hasPdfPageEdits } from "@/lib/pdf/page-edits";
+import type { PdfPageEdits } from "@/lib/pdf/page-edits";
 
 export type DownloadablePdf = {
     fileUrl: string;
     fileName: string;
+    pageEdits?: PdfPageEdits | null;
 };
 
 type ZipEntry = {
@@ -149,22 +152,50 @@ function makeEndOfCentralDirectory(input: {
     return bytes;
 }
 
-async function fetchPdfBlob(fileUrl: string) {
-    const response = await fetch(fileUrl, { cache: "force-cache" });
+const PDF_FETCH_TIMEOUT_MS = 30_000;
 
-    if (!response.ok) {
-        throw new Error(`Failed to fetch PDF: ${response.status}`);
+async function fetchPdfBlob(
+    fileUrl: string,
+    pageEdits?: PdfPageEdits | null,
+    timeoutMs: number = PDF_FETCH_TIMEOUT_MS,
+) {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        const response = await fetch(fileUrl, {
+            cache: "force-cache",
+            signal: controller.signal,
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch PDF: ${response.status}`);
+        }
+
+        return await preparePdfDownloadBlob(await response.blob(), pageEdits);
+    } finally {
+        window.clearTimeout(timeoutId);
     }
-
-    return response.blob();
 }
 
-async function saveBlob(blob: Blob, fileName: string) {
-    if (canUseNativeFileDownload()) {
-        await shareBlobWithNativeDownloads(blob, fileName);
-        return;
+export async function preparePdfDownloadBlob(
+    blob: Blob,
+    pageEdits?: PdfPageEdits | null,
+) {
+    const effectivePageEdits = hasPdfPageEdits(pageEdits) ? pageEdits : null;
+    if (!effectivePageEdits) {
+        return blob;
     }
 
+    const editedBuffer = await applyPdfPageEditsToBuffer(
+        await blob.arrayBuffer(),
+        effectivePageEdits,
+    );
+
+    return new Blob([editedBuffer], { type: blob.type || "application/pdf" });
+}
+
+function saveBlobWithBrowserDownload(blob: Blob, fileName: string) {
     const objectUrl = window.URL.createObjectURL(blob);
     const link = document.createElement("a");
 
@@ -175,6 +206,19 @@ async function saveBlob(blob: Blob, fileName: string) {
     link.remove();
 
     window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 1000);
+}
+
+async function saveBlob(blob: Blob, fileName: string) {
+    if (canUseNativeFileDownload()) {
+        try {
+            await shareBlobWithNativeDownloads(blob, fileName);
+            return;
+        } catch {
+            // Fall back to browser download when native bridge fails.
+        }
+    }
+
+    saveBlobWithBrowserDownload(blob, fileName);
 }
 
 async function createZipBlob(entries: ZipEntry[]) {
@@ -226,11 +270,18 @@ async function createZipBlob(entries: ZipEntry[]) {
     );
 }
 
-export async function downloadPdfFile({ fileUrl, fileName }: DownloadablePdf) {
+export async function downloadPdfFile({ fileUrl, fileName, pageEdits }: DownloadablePdf) {
+    const hasMeaningfulPageEdits = hasPdfPageEdits(pageEdits);
+    let blob: Blob;
+
     try {
-        const blob = await fetchPdfBlob(fileUrl);
-        await saveBlob(blob, ensurePdfFileName(fileName));
+        blob = await fetchPdfBlob(fileUrl, hasMeaningfulPageEdits ? pageEdits : null);
     } catch {
+        if (hasMeaningfulPageEdits) {
+            window.alert("Could not prepare the edited PDF for download. Please try again.");
+            return;
+        }
+
         const fallbackLink = document.createElement("a");
         fallbackLink.href = fileUrl;
         fallbackLink.target = "_blank";
@@ -238,23 +289,61 @@ export async function downloadPdfFile({ fileUrl, fileName }: DownloadablePdf) {
         document.body.appendChild(fallbackLink);
         fallbackLink.click();
         fallbackLink.remove();
+        return;
+    }
+
+    try {
+        await saveBlob(blob, ensurePdfFileName(fileName));
+    } catch {
+        window.alert("Could not save the PDF for download. Please try again.");
     }
 }
+
+export type ZipDownloadResult = {
+    requested: number;
+    succeeded: number;
+    failed: string[];
+};
 
 export async function downloadPdfZip(input: {
     files: DownloadablePdf[];
     zipFileName: string;
-}) {
-    if (!input.files.length) return;
+}): Promise<ZipDownloadResult> {
+    if (!input.files.length) {
+        return { requested: 0, succeeded: 0, failed: [] };
+    }
 
     const dedupedNames = dedupeFileNames(input.files.map((file) => file.fileName));
-    const entries = await Promise.all(
-        input.files.map(async (file, index) => ({
-            fileName: dedupedNames[index],
-            blob: await fetchPdfBlob(file.fileUrl),
-        })),
+
+    // Settle every fetch independently so a single failed/hanging request can't
+    // abort the whole batch. A timeout guarantees stalled fetches reject instead
+    // of leaving the zip — and the caller's "Zipping..." state — pending forever.
+    const settled = await Promise.allSettled(
+        input.files.map((file) => fetchPdfBlob(file.fileUrl, file.pageEdits)),
     );
+
+    const entries: ZipEntry[] = [];
+    const failed: string[] = [];
+
+    settled.forEach((result, index) => {
+        const fileName = dedupedNames[index];
+        if (result.status === "fulfilled") {
+            entries.push({ fileName, blob: result.value });
+        } else {
+            failed.push(fileName);
+        }
+    });
+
+    if (!entries.length) {
+        throw new Error("Every PDF download failed; the zip was not created.");
+    }
 
     const zipBlob = await createZipBlob(entries);
     await saveBlob(zipBlob, ensureZipFileName(input.zipFileName));
+
+    return {
+        requested: input.files.length,
+        succeeded: entries.length,
+        failed,
+    };
 }

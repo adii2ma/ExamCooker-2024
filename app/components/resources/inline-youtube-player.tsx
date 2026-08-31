@@ -1,8 +1,30 @@
 "use client";
 
-import { useEffect, useReducer, useRef } from "react";
+import {
+    type SyntheticEvent,
+    useEffect,
+    useReducer,
+    useRef,
+    useState,
+} from "react";
 import ReactPlayer from "react-player";
-import { Pause, Play, Volume1, Volume2, VolumeX } from "lucide-react";
+import {
+    ExternalLink,
+    Loader2,
+    Pause,
+    Play,
+    RotateCcw,
+    TriangleAlert,
+    Volume1,
+    Volume2,
+    VolumeX,
+} from "lucide-react";
+import {
+    getStuckTimeoutMs,
+    type InlineYouTubePlaybackStatus,
+    shouldArmStuckLoadTimeout,
+} from "@/lib/media/inline-youtube-watchdog";
+import { captureInlineVideoLoadFailed } from "@/lib/posthog/client";
 import { cn } from "@/lib/utils";
 
 type InlineYouTubePlayerProps = {
@@ -11,21 +33,18 @@ type InlineYouTubePlayerProps = {
     autoplay?: boolean;
 };
 
-type ProgressState = {
-    played: number;
-    playedSeconds: number;
-    loaded: number;
-    loadedSeconds: number;
-};
+type PlaybackStatus = InlineYouTubePlaybackStatus;
 
 type PlayerState = {
     currentTime: number;
     duration: number;
+    isBuffering: boolean;
     isMuted: boolean;
     isPlaying: boolean;
     playbackSpeed: number;
     progress: number;
     showControls: boolean;
+    status: PlaybackStatus;
     useNativeControls: boolean;
     volume: number;
 };
@@ -39,17 +58,27 @@ type PlayerAction =
     | { type: "duration"; duration: number }
     | { type: "speed"; speed: number }
     | { type: "controls"; show: boolean }
-    | { type: "native-controls"; enabled: boolean };
+    | { type: "native-controls"; enabled: boolean }
+    | { type: "ready" }
+    | { type: "buffering"; buffering: boolean }
+    | { type: "error" }
+    | { type: "reload"; playing: boolean };
 
-function createInitialPlayerState(autoplay: boolean): PlayerState {
+function createInitialPlayerState(): PlayerState {
     return {
         currentTime: 0,
         duration: 0,
+        isBuffering: false,
         isMuted: false,
-        isPlaying: autoplay,
+        // Never assume playback before the embed reports it. Seeding this from
+        // `autoplay` made the overlay render "Pause" for a video that hadn't
+        // started (YouTube blocks unmuted autoplay), so the first click paused
+        // nothing and desynced the button. Autoplay intent is applied on ready.
+        isPlaying: false,
         playbackSpeed: 1,
         progress: 0,
         showControls: false,
+        status: "loading",
         useNativeControls: false,
         volume: 1,
     };
@@ -87,6 +116,27 @@ function playerReducer(state: PlayerState, action: PlayerAction): PlayerState {
             return { ...state, showControls: action.show };
         case "native-controls":
             return { ...state, useNativeControls: action.enabled };
+        case "ready":
+            // A successful (re)load clears any prior error and stops buffering.
+            return { ...state, status: "ready", isBuffering: false };
+        case "buffering":
+            // Ignore buffering signals once we've given up on the embed.
+            if (state.status === "error") {
+                return state;
+            }
+            return { ...state, isBuffering: action.buffering };
+        case "error":
+            return { ...state, status: "error", isBuffering: false, isPlaying: false };
+        case "reload":
+            // Retry: drop back to a clean loading state for the fresh iframe.
+            return {
+                ...state,
+                status: "loading",
+                isBuffering: false,
+                isPlaying: action.playing,
+                currentTime: 0,
+                progress: 0,
+            };
     }
 }
 
@@ -177,22 +227,42 @@ function InlineYouTubePlayerInner({
     title,
     autoplay = false,
 }: InlineYouTubePlayerProps) {
-    const playerRef = useRef<ReactPlayer | null>(null);
+    const playerRef = useRef<HTMLVideoElement | null>(null);
     const lastVolumeRef = useRef(1);
+    // Bumping this remounts the underlying iframe, which is how we retry a
+    // wedged embed without forcing the user to switch videos.
+    const [reloadKey, setReloadKey] = useState(0);
+    // Transient message shown when a scrubber drag can't be applied yet, so the
+    // interaction gives feedback instead of silently doing nothing.
+    const [seekHint, setSeekHint] = useState<string | null>(null);
+    const seekHintTimeoutRef = useRef<number | null>(null);
+    // Retry count. Each retry escalates the watchdog budget (see
+    // getStuckTimeoutMs) instead of replaying the same 20s over and over.
+    const [attempt, setAttempt] = useState(0);
+    // Ensures we report a given failed attempt at most once, even if both the
+    // watchdog and react-player's onError fire for the same load.
+    const reportedErrorRef = useRef(false);
+    // Playback intent and actual playback are deliberately separate. Intent
+    // arms the load watchdog and survives until the iframe is ready; media
+    // events below own `isPlaying`, so the UI never claims playback started
+    // merely because play() was requested.
+    const [playbackRequested, setPlaybackRequested] = useState(autoplay);
     const [
         {
             currentTime,
             duration,
+            isBuffering,
             isMuted,
             isPlaying,
             playbackSpeed,
             progress,
             showControls,
+            status,
             useNativeControls,
             volume,
         },
         dispatch,
-    ] = useReducer(playerReducer, autoplay, createInitialPlayerState);
+    ] = useReducer(playerReducer, undefined, createInitialPlayerState);
 
     useEffect(() => {
         if (typeof window === "undefined") return;
@@ -230,10 +300,113 @@ function InlineYouTubePlayerInner({
         };
     }, []);
 
+    // If a play attempt never reaches ready, treat it as a failed load so the
+    // viewer gets a retry/fallback instead of a dead frame. The watchdog is
+    // measured from an actual play request, not from mount, so a
+    // healthy embed the user simply hasn't pressed play on is never failed on
+    // elapsed time. Ready-state buffering can legitimately last on slow
+    // connections, so it should not become a hard player error either.
+    useEffect(() => {
+        if (!shouldArmStuckLoadTimeout(status, playbackRequested)) return;
+
+        const timeout = window.setTimeout(() => {
+            reportedErrorRef.current = true;
+            captureInlineVideoLoadFailed({
+                videoId,
+                trigger: "watchdog",
+                autoplay,
+                attempt,
+            });
+            setPlaybackRequested(false);
+            dispatch({ type: "error" });
+        }, getStuckTimeoutMs(attempt));
+
+        return () => window.clearTimeout(timeout);
+    }, [status, playbackRequested, attempt, reloadKey, videoId, autoplay]);
+
+    // Clear any pending seek-hint timer on unmount.
+    useEffect(
+        () => () => {
+            if (seekHintTimeoutRef.current !== null) {
+                window.clearTimeout(seekHintTimeoutRef.current);
+            }
+        },
+        [],
+    );
+
+    const showSeekHint = (message: string) => {
+        setSeekHint(message);
+        if (seekHintTimeoutRef.current !== null) {
+            window.clearTimeout(seekHintTimeoutRef.current);
+        }
+        seekHintTimeoutRef.current = window.setTimeout(() => {
+            setSeekHint(null);
+            seekHintTimeoutRef.current = null;
+        }, 2500);
+    };
+
     const url = `https://www.youtube.com/watch?v=${videoId}`;
 
+    const handlePlayerError = () => {
+        if (!reportedErrorRef.current) {
+            reportedErrorRef.current = true;
+            captureInlineVideoLoadFailed({
+                videoId,
+                trigger: "player_error",
+                autoplay,
+                attempt,
+            });
+        }
+        setPlaybackRequested(false);
+        dispatch({ type: "error" });
+    };
+
+    const handleRetry = () => {
+        // Clear the one-shot guard, escalate the watchdog budget, and force a
+        // real play attempt so the longer timer measures from the retry rather
+        // than replaying the same failed 20s.
+        reportedErrorRef.current = false;
+        setAttempt((value) => value + 1);
+        setPlaybackRequested(true);
+        dispatch({ type: "reload", playing: false });
+        setReloadKey((value) => value + 1);
+    };
+
+    // Drive playback off the real media element and reconcile the button against
+    // what the iframe actually did. A play() the browser rejects (e.g. unmuted
+    // autoplay policy) corrects the state back to paused instead of desyncing.
+    const playMedia = () => {
+        const player = playerRef.current;
+        setPlaybackRequested(true);
+        const started = player?.play?.();
+        if (started && typeof started.then === "function") {
+            started.catch(() => {
+                setPlaybackRequested(false);
+                dispatch({
+                    type: "playing",
+                    playing: player ? !player.paused : false,
+                });
+            });
+        }
+    };
+
+    const pauseMedia = () => {
+        const player = playerRef.current;
+        setPlaybackRequested(false);
+        dispatch({ type: "playing", playing: false });
+        player?.pause?.();
+    };
+
     const togglePlay = () => {
-        dispatch({ type: "playing", playing: !isPlaying });
+        if (status === "error") return;
+        // The button reflects confirmed media state. In particular, an autoplay
+        // request may still be pending/rejected while the control says "Play";
+        // that first user gesture must issue play() instead of cancelling intent.
+        if (isPlaying) {
+            pauseMedia();
+        } else {
+            playMedia();
+        }
     };
 
     const handleVolumeChange = (nextValue: number) => {
@@ -245,25 +418,69 @@ function InlineYouTubePlayerInner({
         }
     };
 
-    const handleProgress = (state: ProgressState) => {
+    const handleTimeUpdate = (event: SyntheticEvent<HTMLVideoElement>) => {
+        const media = event.currentTarget;
+        const currentTime = Number.isFinite(media.currentTime)
+            ? media.currentTime
+            : 0;
+        const nextDuration = Number.isFinite(media.duration) ? media.duration : duration;
+
         dispatch({
             type: "progress",
-            currentTime: state.playedSeconds,
-            progress: state.played * 100,
+            currentTime,
+            progress: nextDuration > 0 ? (currentTime / nextDuration) * 100 : 0,
         });
     };
 
     const handleSeek = (nextValue: number) => {
         const player = playerRef.current;
-        if (!player || !duration) {
+        // react-player v3 exposes the underlying media element on the ref, so
+        // prefer its live duration and fall back to the tracked value. Bail out
+        // while loading/errored or before we have a duration to seek within.
+        const seekableDuration =
+            player && Number.isFinite(player.duration) && player.duration > 0
+                ? player.duration
+                : duration;
+
+        // Re-pin the scrubber to the video's real position so a rejected seek
+        // snaps the thumb back instead of leaving it stranded where the user
+        // released it.
+        const repinToReality = () => {
+            dispatch({
+                type: "seek",
+                currentTime,
+                progress: seekableDuration
+                    ? clampPercentage((currentTime / seekableDuration) * 100)
+                    : 0,
+            });
+        };
+
+        if (!player || status !== "ready" || !seekableDuration) {
+            repinToReality();
+            showSeekHint(
+                status === "ready"
+                    ? "Nothing to seek yet"
+                    : "Video is still loading…",
+            );
             return;
         }
 
         const playedFraction = clampPercentage(nextValue) / 100;
-        player.seekTo(playedFraction, "fraction");
+        const nextTime = playedFraction * seekableDuration;
+
+        try {
+            player.currentTime = nextTime;
+        } catch {
+            // Some embed states reject direct time assignment. Snap back to the
+            // real position and surface it, rather than silently doing nothing.
+            repinToReality();
+            showSeekHint("Couldn't seek right now");
+            return;
+        }
+
         dispatch({
             type: "seek",
-            currentTime: playedFraction * duration,
+            currentTime: nextTime,
             progress: playedFraction * 100,
         });
     };
@@ -298,41 +515,115 @@ function InlineYouTubePlayerInner({
             <div className="absolute inset-0">
                 <ReactPlayer
                     ref={playerRef}
-                    key={`${videoId}-${autoplay ? "a" : "p"}-${useNativeControls ? "native" : "custom"}`}
-                    url={url}
-                    playing={isPlaying}
+                    // Only remount for a different video or an explicit retry.
+                    // Keying on autoplay/native-controls flips (which fire from
+                    // an effect right after mount on touch devices) forced a
+                    // full iframe reload and a black frame on load/switch.
+                    key={`${videoId}-${reloadKey}`}
+                    src={url}
                     controls={useNativeControls}
                     width="100%"
                     height="100%"
                     volume={volume}
                     muted={isMuted}
                     playbackRate={playbackSpeed}
-                    playsinline
-                    onPlay={() => dispatch({ type: "playing", playing: true })}
-                    onPause={() => dispatch({ type: "playing", playing: false })}
-                    onEnded={() => dispatch({ type: "playing", playing: false })}
-                    onProgress={handleProgress}
-                    onDuration={(nextDuration) =>
-                        dispatch({ type: "duration", duration: nextDuration })
+                    playsInline
+                    onReady={() => {
+                        dispatch({ type: "ready" });
+                        // Apply queued autoplay/user/retry intent only once the
+                        // embed is actually playable, and reconcile if the
+                        // browser blocks it.
+                        if (playbackRequested) playMedia();
+                    }}
+                    onError={handlePlayerError}
+                    onWaiting={() => dispatch({ type: "buffering", buffering: true })}
+                    onPlaying={() => {
+                        dispatch({ type: "ready" });
+                        setPlaybackRequested(true);
+                        dispatch({ type: "playing", playing: true });
+                    }}
+                    onCanPlay={() => dispatch({ type: "buffering", buffering: false })}
+                    onPlay={() => {
+                        setPlaybackRequested(true);
+                        dispatch({ type: "playing", playing: true });
+                    }}
+                    onPause={() => {
+                        setPlaybackRequested(false);
+                        dispatch({ type: "playing", playing: false });
+                    }}
+                    onEnded={() => {
+                        setPlaybackRequested(false);
+                        dispatch({ type: "playing", playing: false });
+                    }}
+                    onTimeUpdate={handleTimeUpdate}
+                    onDurationChange={(event) =>
+                        dispatch({
+                            type: "duration",
+                            duration: Number.isFinite(event.currentTarget.duration)
+                                ? event.currentTarget.duration
+                                : 0,
+                        })
                     }
                     config={{
                         youtube: {
-                            playerVars: {
-                                autoplay: autoplay ? 1 : 0,
-                                controls: useNativeControls ? 1 : 0,
-                                disablekb: useNativeControls ? 0 : 1,
-                                fs: 1,
-                                iv_load_policy: 3,
-                                modestbranding: 1,
-                                playsinline: 1,
-                                rel: 0,
-                            },
+                            disablekb: useNativeControls ? 0 : 1,
+                            fs: 1,
+                            iv_load_policy: 3,
+                            rel: 0,
                         },
                     }}
                 />
             </div>
 
-            {useNativeControls ? null : (
+            {status !== "error" && (status === "loading" || isBuffering) ? (
+                <div
+                    className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-[#0A0F1C]/60"
+                    role="status"
+                    aria-live="polite"
+                >
+                    <Loader2 className="size-10 animate-spin text-white/90" />
+                    <span className="sr-only">Loading video…</span>
+                </div>
+            ) : null}
+
+            {status === "error" ? (
+                <div
+                    className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-4 bg-[#0A0F1C]/90 px-6 text-center"
+                    role="alert"
+                >
+                    <TriangleAlert className="size-8 text-[#5FC4E7]" />
+                    <div className="space-y-1">
+                        <p className="text-sm font-semibold text-white">
+                            This video didn&apos;t load
+                        </p>
+                        <p className="text-xs text-white/70">
+                            The player got stuck. Try again, or open it directly
+                            on YouTube.
+                        </p>
+                    </div>
+                    <div className="flex flex-wrap items-center justify-center gap-2">
+                        <button
+                            type="button"
+                            onClick={handleRetry}
+                            className="inline-flex items-center gap-2 rounded-md bg-[#5FC4E7] px-3 py-2 text-sm font-semibold text-[#0A0F1C] transition hover:bg-[#5FC4E7]/85"
+                        >
+                            <RotateCcw className="size-4" />
+                            Retry
+                        </button>
+                        <a
+                            href={url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex items-center gap-2 rounded-md border border-white/25 px-3 py-2 text-sm font-semibold text-white transition hover:bg-white/10"
+                        >
+                            <ExternalLink className="size-4" />
+                            Watch on YouTube
+                        </a>
+                    </div>
+                </div>
+            ) : null}
+
+            {useNativeControls || status === "error" ? null : (
                 <button
                     type="button"
                     onClick={togglePlay}
@@ -345,7 +636,7 @@ function InlineYouTubePlayerInner({
                 </button>
             )}
 
-            {useNativeControls ? null : (
+            {useNativeControls || status === "error" ? null : (
                 <div
                     className={cn(
                         "absolute bottom-4 left-1/2 z-20 w-[calc(100%-1rem)] max-w-xl -translate-x-1/2 rounded-2xl bg-[#11111198] p-4 backdrop-blur-md transition duration-200",
@@ -354,6 +645,15 @@ function InlineYouTubePlayerInner({
                             : "pointer-events-none translate-y-4 opacity-0",
                     )}
                 >
+                    {seekHint ? (
+                        <p
+                            className="mx-auto mb-1 max-w-lg text-center text-xs text-white/80"
+                            role="status"
+                            aria-live="polite"
+                        >
+                            {seekHint}
+                        </p>
+                    ) : null}
                     <div className="mx-auto mb-2 flex max-w-lg items-center justify-center gap-2">
                         <span className="text-sm text-white">{formatTime(currentTime)}</span>
                         <Slider

@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { Redis } from "@upstash/redis";
+import type { AppRedisClient } from "@/lib/redis";
 import { getOptionalRedis } from "@/lib/redis";
 
 const CACHE_KEY_PREFIX = "ec:past-papers-surface-cache";
-const CACHE_SCHEMA_VERSION = 1;
+const CACHE_SCHEMA_VERSION = 2;
 const NAMESPACE_VERSION_KEY = `${CACHE_KEY_PREFIX}:namespace-version`;
 const DEFAULT_CACHE_TTL_SECONDS = 900;
 const DEFAULT_LOCK_TTL_SECONDS = 15;
@@ -36,6 +36,28 @@ function sleep(ms: number) {
 
 function hashText(value: string) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function formatRecoverableCacheError(error: unknown) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+}
+
+const loggedRecoverableCacheWarnings = new Set<string>();
+
+function warnRecoverableCacheError(label: string, error: unknown) {
+  const message = formatRecoverableCacheError(error);
+  const warningKey = `${label}: ${message}`;
+
+  if (loggedRecoverableCacheWarnings.has(warningKey)) {
+    return;
+  }
+
+  loggedRecoverableCacheWarnings.add(warningKey);
+  console.warn(`[past-papers-surface-cache] ${warningKey}`);
 }
 
 function normalizeStableValue(value: unknown): unknown {
@@ -96,7 +118,7 @@ function parseRedisValue<T>(
 async function readCacheEntry<T>(input: {
   cacheKey: string;
   deserialize?: DeserializeValue<T>;
-  redis: Redis;
+  redis: AppRedisClient;
 }): Promise<CacheReadResult<T>> {
   const rawValue = await input.redis.get<unknown>(input.cacheKey);
   const parsedValue = parseRedisValue(rawValue, input.deserialize);
@@ -108,7 +130,7 @@ async function readCacheEntry<T>(input: {
   return parsedValue;
 }
 
-async function tryAcquireCacheLock(redis: Redis, cacheKey: string) {
+async function tryAcquireCacheLock(redis: AppRedisClient, cacheKey: string) {
   const token = randomUUID();
   const result = await redis.set(buildLockKey(cacheKey), token, {
     ex: parsePositiveIntegerEnv(
@@ -121,7 +143,11 @@ async function tryAcquireCacheLock(redis: Redis, cacheKey: string) {
   return result === "OK" ? token : null;
 }
 
-async function releaseCacheLock(redis: Redis, cacheKey: string, token: string | null) {
+async function releaseCacheLock(
+  redis: AppRedisClient,
+  cacheKey: string,
+  token: string | null,
+) {
   if (!token) {
     return;
   }
@@ -131,14 +157,14 @@ async function releaseCacheLock(redis: Redis, cacheKey: string, token: string | 
   try {
     await redis.eval(RELEASE_LOCK_SCRIPT, [lockKey], [token]);
   } catch (error) {
-    console.error("[past-papers-surface-cache] lock release failed", error);
+    warnRecoverableCacheError("lock release failed", error);
   }
 }
 
 async function waitForCacheEntry<T>(input: {
   cacheKey: string;
   deserialize?: DeserializeValue<T>;
-  redis: Redis;
+  redis: AppRedisClient;
 }): Promise<CacheReadResult<T>> {
   const deadline =
     Date.now() +
@@ -160,7 +186,7 @@ async function waitForCacheEntry<T>(input: {
         return cachedValue;
       }
     } catch (error) {
-      console.error("[past-papers-surface-cache] wait read failed", error);
+      warnRecoverableCacheError("wait read failed", error);
       return { type: "miss" };
     }
   }
@@ -170,10 +196,16 @@ async function waitForCacheEntry<T>(input: {
 
 async function storeCacheEntry<T>(input: {
   cacheKey: string;
-  redis: Redis;
+  redis: AppRedisClient;
   ttlSeconds?: number;
   value: T;
 }) {
+  // A temporary database/cache miss must not become a shared 404 for a real
+  // paper. Successful reads are worth sharing; absence is cheap to recheck.
+  if (input.value === null || input.value === undefined) {
+    return;
+  }
+
   await input.redis.set(input.cacheKey, JSON.stringify(input.value), {
     ex:
       input.ttlSeconds ??
@@ -195,7 +227,7 @@ async function readNamespaceVersion() {
     const parsedValue = Number(rawValue);
     return Number.isFinite(parsedValue) && parsedValue >= 0 ? parsedValue : 0;
   } catch (error) {
-    console.error("[past-papers-surface-cache] namespace read failed", error);
+    warnRecoverableCacheError("namespace read failed", error);
     return 0;
   }
 }
@@ -226,7 +258,7 @@ export async function withPastPapersSurfaceRedisCache<T>(
       return cachedValue.value;
     }
   } catch (error) {
-    console.error("[past-papers-surface-cache] cache read failed", error);
+    warnRecoverableCacheError("cache read failed", error);
     return loader();
   }
 
@@ -235,7 +267,7 @@ export async function withPastPapersSurfaceRedisCache<T>(
   try {
     lockToken = await tryAcquireCacheLock(redis, cacheKey);
   } catch (error) {
-    console.error("[past-papers-surface-cache] lock acquire failed", error);
+    warnRecoverableCacheError("lock acquire failed", error);
   }
 
   if (!lockToken) {
@@ -259,7 +291,7 @@ export async function withPastPapersSurfaceRedisCache<T>(
         value,
       });
     } catch (error) {
-      console.error("[past-papers-surface-cache] fallback write failed", error);
+      warnRecoverableCacheError("fallback write failed", error);
     }
 
     return value;
@@ -285,7 +317,7 @@ export async function withPastPapersSurfaceRedisCache<T>(
         value,
       });
     } catch (error) {
-      console.error("[past-papers-surface-cache] cache write failed", error);
+      warnRecoverableCacheError("cache write failed", error);
     }
 
     return value;
@@ -303,7 +335,7 @@ export async function invalidatePastPapersSurfaceCache() {
   try {
     return await redis.incr(NAMESPACE_VERSION_KEY);
   } catch (error) {
-    console.error("[past-papers-surface-cache] namespace bump failed", error);
+    warnRecoverableCacheError("namespace bump failed", error);
     return null;
   }
 }

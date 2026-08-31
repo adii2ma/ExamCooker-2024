@@ -16,6 +16,7 @@ import {
     pastPaper,
     semesterValues,
 } from "@/db";
+import type { PdfPageEdits } from "@/lib/pdf/page-edits";
 
 export type CoursePaperFilters = {
     examTypes?: ExamType[];
@@ -26,7 +27,8 @@ export type CoursePaperFilters = {
     hasAnswerKey?: boolean;
 };
 
-export type CoursePaperSort = "year_desc" | "year_asc" | "recent";
+export type CoursePaperSort = "seasonal" | "year_desc" | "year_asc" | "recent";
+type NonSeasonalCoursePaperSort = Exclude<CoursePaperSort, "seasonal">;
 
 export type CoursePaperListItem = {
     id: string;
@@ -37,6 +39,7 @@ export type CoursePaperListItem = {
     slot: string | null;
     year: number | null;
     hasAnswerKey: boolean;
+    pageEdits: PdfPageEdits | null;
 };
 
 export type CoursePaperFilterOptions = {
@@ -84,7 +87,7 @@ async function getCoursePaperRows(courseId: string): Promise<CoursePaperRow[]> {
 
     return withPastPapersSurfaceRedisCache(
         {
-            keyParts: ["course-paper-rows", { courseId }],
+            keyParts: ["course-paper-rows-v2", { courseId }],
         },
         async () => {
             const rows = await db
@@ -99,6 +102,7 @@ async function getCoursePaperRows(courseId: string): Promise<CoursePaperRow[]> {
                     semester: pastPaper.semester,
                     campus: pastPaper.campus,
                     hasAnswerKey: pastPaper.hasAnswerKey,
+                    pageEdits: pastPaper.pageEdits,
                     createdAt: pastPaper.createdAt,
                 })
                 .from(pastPaper)
@@ -115,6 +119,7 @@ async function getCoursePaperRows(courseId: string): Promise<CoursePaperRow[]> {
                 semester: paper.semester,
                 campus: paper.campus,
                 hasAnswerKey: paper.hasAnswerKey,
+                pageEdits: paper.pageEdits ?? null,
                 createdAtTime: paper.createdAt.getTime(),
             }));
         },
@@ -160,10 +165,16 @@ function rowMatchesFilters(
     return true;
 }
 
-function comparePaperRows(sort: CoursePaperSort) {
+function comparePaperRows(sort: CoursePaperSort, examFocus?: ExamType) {
     return (a: CoursePaperRow, b: CoursePaperRow) => {
         if (sort === "recent") {
             return b.createdAtTime - a.createdAtTime;
+        }
+
+        if (sort === "seasonal" && examFocus) {
+            const aIsExamFocus = a.examType === examFocus;
+            const bIsExamFocus = b.examType === examFocus;
+            if (aIsExamFocus !== bIsExamFocus) return aIsExamFocus ? -1 : 1;
         }
 
         if (a.year === null && b.year === null) {
@@ -187,16 +198,26 @@ function toCoursePaperListItem(row: CoursePaperRow): CoursePaperListItem {
         slot: row.slot,
         year: row.year,
         hasAnswerKey: row.hasAnswerKey,
+        pageEdits: row.pageEdits ?? null,
     };
 }
 
-export async function getCoursePapers(input: {
+type OrderedCoursePapersInput = {
     courseId: string;
     filters: CoursePaperFilters;
-    sort: CoursePaperSort;
+} & (
+    | { sort: "seasonal"; examFocus: ExamType }
+    | { sort: NonSeasonalCoursePaperSort; examFocus?: never }
+);
+
+type GetCoursePapersInput = {
     page: number;
     pageSize: number;
-}): Promise<{ papers: CoursePaperListItem[]; totalCount: number }> {
+} & OrderedCoursePapersInput;
+
+export async function getOrderedCoursePapers(
+    input: OrderedCoursePapersInput,
+): Promise<CoursePaperListItem[]> {
     "use cache";
     cacheTag("past_papers");
     cacheLife({ stale: 60, revalidate: 300, expire: 3600 });
@@ -209,14 +230,27 @@ export async function getCoursePapers(input: {
         if (rowMatchesFilters(row, filterSets)) filteredRows.push(row);
     }
 
-    filteredRows.sort(comparePaperRows(input.sort));
+    filteredRows.sort(comparePaperRows(input.sort, input.examFocus));
 
-    const skip = Math.max(0, (input.page - 1) * input.pageSize);
-    const visibleRows = filteredRows.slice(skip, skip + input.pageSize);
+    return filteredRows.map(toCoursePaperListItem);
+}
+
+export async function getCoursePapers(
+    input: GetCoursePapersInput,
+): Promise<{ papers: CoursePaperListItem[]; totalCount: number }> {
+    "use cache";
+    cacheTag("past_papers");
+    cacheLife({ stale: 60, revalidate: 300, expire: 3600 });
+
+    const { page, pageSize, ...orderedInput } = input;
+    const orderedRows = await getOrderedCoursePapers(orderedInput);
+
+    const skip = Math.max(0, (page - 1) * pageSize);
+    const visibleRows = orderedRows.slice(skip, skip + pageSize);
 
     return {
-        totalCount: filteredRows.length,
-        papers: visibleRows.map(toCoursePaperListItem),
+        totalCount: orderedRows.length,
+        papers: visibleRows,
     };
 }
 

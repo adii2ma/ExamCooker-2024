@@ -7,8 +7,11 @@ import { useRouter } from "next/navigation";
 import SearchIcon from "@/app/components/assets/seacrh.svg";
 import VoiceAgentButton from "@/app/components/voice/voice-agent-button";
 import { getAliasCourseCodes } from "@/lib/course-aliases";
+import { createCourseFuse } from "@/lib/course-search-fuse";
 import { normalizeCourseCode } from "@/lib/course-tags";
 import {
+    captureCourseSearchFocused,
+    captureCourseSearchNoResults,
     captureCourseSearchSelection,
     captureCourseSearchSubmitted,
     type CourseSearchInteraction,
@@ -28,26 +31,18 @@ export type CourseResult = {
     noteCount: number;
     paperCount: number;
     syllabusId: string | null;
+    aliases?: string[];
 };
+
+const MAX_RESULTS = 8;
+
+// How many courses to preview when the field is empty and focused. `courses`
+// arrives already ranked by paper/note count (see `getSearchableCourses`), so
+// the head of the list is the popular, content-rich set.
+const MAX_SUGGESTIONS = 6;
 
 interface CourseSearchProps {
     courses: CourseResult[];
-}
-
-function normalizeSearchInput(value: string) {
-    return value
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-}
-
-function includesAllTerms(value: string, terms: string[]) {
-    for (const term of terms) {
-        if (!value.includes(term)) return false;
-    }
-
-    return true;
 }
 
 function runAfterCurrentTask(callback: () => void) {
@@ -70,6 +65,8 @@ export default function CourseSearch({ courses }: CourseSearchProps) {
         nativeCourseSearchAvailable && !nativeSearchUnavailable;
     const inputRef = useRef<HTMLInputElement>(null);
     const dropdownRef = useRef<HTMLDivElement>(null);
+    // Report the empty-focus case once per visit so it stops being replay-only.
+    const emptyFocusReported = useRef(false);
     const deferredQuery = useDeferredValue(query);
     const voiceAgentEnabled =
         usePostHogFeatureFlagEnabled(POSTHOG_FEATURE_FLAGS.voiceAgent) ?? false;
@@ -89,17 +86,12 @@ export default function CourseSearch({ courses }: CourseSearchProps) {
         });
     };
 
-    const searchableCourses = useMemo(
-        () =>
-            courses.map((course) => ({
-                course,
-                codeUpper: course.code.toUpperCase(),
-                normalizedSearchable: normalizeSearchInput(
-                    `${course.code} ${course.title}`,
-                ),
-            })),
-        [courses],
-    );
+    // Fuzzy index shared with the command palette / voice search and the notes
+    // and past-papers grids (same per-token coverage ranking via
+    // `createCourseFuse`), so typos, word-order variations, partial multi-word
+    // queries ("forensic science") and short prefixes ("mu") all match here too
+    // instead of dead-ending on whole-query matching or the old substring logic.
+    const courseFuse = useMemo(() => createCourseFuse(courses), [courses]);
 
     const filteredCourses = useMemo(() => {
         const trimmed = deferredQuery.trim();
@@ -107,37 +99,85 @@ export default function CourseSearch({ courses }: CourseSearchProps) {
         const aliasCodes = getAliasCourseCodes(trimmed);
         const aliasSet = new Set(aliasCodes.map((code) => code.toUpperCase()));
         const normalizedCodeQuery = normalizeCourseCode(trimmed);
-        const normalizedQuery = normalizeSearchInput(trimmed);
-        const queryTerms = normalizedQuery.split(" ").filter(Boolean);
 
         const matches: CourseResult[] = [];
-        for (const { course, codeUpper, normalizedSearchable } of searchableCourses) {
-            if (
-                aliasSet.has(codeUpper) ||
-                codeUpper === normalizedCodeQuery ||
-                includesAllTerms(normalizedSearchable, queryTerms)
-            ) {
-                matches.push(course);
-                if (matches.length === 8) break;
+        const seen = new Set<string>();
+        const pushCourse = (course: CourseResult) => {
+            if (seen.has(course.code)) return;
+            seen.add(course.code);
+            matches.push(course);
+        };
+
+        // 1. Exact code + acronym/alias matches — highest confidence, always first.
+        for (const course of courses) {
+            const codeUpper = course.code.toUpperCase();
+            if (aliasSet.has(codeUpper) || codeUpper === normalizedCodeQuery) {
+                pushCourse(course);
             }
         }
 
-        return matches;
-    }, [deferredQuery, searchableCourses]);
+        // 2. Course-code prefixes (e.g. typing "BCSE20" before finishing the code).
+        if (normalizedCodeQuery.length >= 2) {
+            for (const course of courses) {
+                if (matches.length >= MAX_RESULTS) break;
+                if (course.code.toUpperCase().startsWith(normalizedCodeQuery)) {
+                    pushCourse(course);
+                }
+            }
+        }
+
+        // 3. Fuzzy relevance ranking for everything else (typos, word order, titles).
+        for (const { item } of courseFuse.search(trimmed, { limit: MAX_RESULTS })) {
+            if (matches.length >= MAX_RESULTS) break;
+            pushCourse(item);
+        }
+
+        return matches.slice(0, MAX_RESULTS);
+    }, [deferredQuery, courses, courseFuse]);
+
+    // Popular courses to preview on an empty, focused field so clicking the bar
+    // always surfaces something actionable instead of a silent no-op, and shows
+    // people what a valid query looks like.
+    const suggestions = useMemo(
+        () => courses.slice(0, MAX_SUGGESTIONS),
+        [courses],
+    );
+    const showingSuggestions = query.trim().length === 0;
+    const visibleCourses = showingSuggestions ? suggestions : filteredCourses;
+
     const dropdownVisible =
-        !nativeSearchAvailable && isOpen && (filteredCourses.length > 0 || query.trim().length > 0);
+        !nativeSearchAvailable &&
+        isOpen &&
+        (visibleCourses.length > 0 || query.trim().length > 0);
 
     useEffect(() => {
-        if (!dropdownVisible || filteredCourses.length === 0) return;
+        if (!dropdownVisible || visibleCourses.length === 0) return;
 
         const timeoutId = window.setTimeout(() => {
-            for (const course of filteredCourses.slice(0, 4)) {
+            for (const course of visibleCourses.slice(0, 4)) {
                 prefetch(getCoursePastPapersPath(course.code));
             }
         }, 50);
 
         return () => window.clearTimeout(timeoutId);
-    }, [dropdownVisible, filteredCourses, prefetch]);
+    }, [dropdownVisible, visibleCourses, prefetch]);
+
+    // Report queries that settle on zero results so we can finally see what
+    // people search for and can't find. Debounced and de-duplicated so a single
+    // failed search fires one event rather than one per keystroke.
+    const lastNoResultQuery = useRef<string | null>(null);
+    useEffect(() => {
+        const trimmed = deferredQuery.trim();
+        if (trimmed.length < 2 || filteredCourses.length > 0) return;
+        if (lastNoResultQuery.current === trimmed) return;
+
+        const timeoutId = window.setTimeout(() => {
+            lastNoResultQuery.current = trimmed;
+            captureCourseSearchNoResults({ context: "home", query: trimmed });
+        }, 600);
+
+        return () => window.clearTimeout(timeoutId);
+    }, [deferredQuery, filteredCourses]);
 
     const alignSearchInputForNativeAndroid = () => {
         if (
@@ -174,7 +214,9 @@ export default function CourseSearch({ courses }: CourseSearchProps) {
     const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const value = e.target.value;
         setQuery(value);
-        setIsOpen(value.trim().length > 0);
+        // Keep the dropdown open while the field is focused: it shows matches
+        // when there's a query and the popular-course suggestions when empty.
+        setIsOpen(true);
         setHighlightedIndex(-1);
     };
 
@@ -197,7 +239,7 @@ export default function CourseSearch({ courses }: CourseSearchProps) {
             context: "home",
             interaction,
             courseCode: course.code,
-            resultCount: filteredCourses.length,
+            resultCount: visibleCourses.length,
             resultIndex: options?.resultIndex,
             paperCount: course.paperCount,
             noteCount: course.noteCount,
@@ -229,21 +271,21 @@ export default function CourseSearch({ courses }: CourseSearchProps) {
     };
 
     const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-        if (!isOpen || filteredCourses.length === 0) return;
+        if (!isOpen || visibleCourses.length === 0) return;
 
         if (e.key === 'ArrowDown') {
             e.preventDefault();
             setHighlightedIndex(prev =>
-                prev < filteredCourses.length - 1 ? prev + 1 : 0
+                prev < visibleCourses.length - 1 ? prev + 1 : 0
             );
         } else if (e.key === 'ArrowUp') {
             e.preventDefault();
             setHighlightedIndex(prev =>
-                prev > 0 ? prev - 1 : filteredCourses.length - 1
+                prev > 0 ? prev - 1 : visibleCourses.length - 1
             );
         } else if (e.key === 'Enter' && highlightedIndex >= 0) {
             e.preventDefault();
-            handleSelectCourse(filteredCourses[highlightedIndex], {
+            handleSelectCourse(visibleCourses[highlightedIndex], {
                 interaction: "keyboard",
                 resultIndex: highlightedIndex,
             });
@@ -365,8 +407,13 @@ export default function CourseSearch({ courses }: CourseSearchProps) {
                             onChange={handleInputChange}
                             onKeyDown={handleKeyDown}
                             onFocus={() => {
-                                if (query.trim()) {
-                                    setIsOpen(true);
+                                setIsOpen(true);
+                                if (!query.trim() && !emptyFocusReported.current) {
+                                    emptyFocusReported.current = true;
+                                    captureCourseSearchFocused({
+                                        context: "home",
+                                        suggestionCount: suggestions.length,
+                                    });
                                 }
                                 alignSearchInputForNativeAndroid();
                             }}
@@ -414,8 +461,14 @@ export default function CourseSearch({ courses }: CourseSearchProps) {
                         ref={dropdownRef}
                         className="absolute z-50 w-full mt-2 bg-white dark:bg-[#0C1222] border border-black/15 dark:border-[#D5D5D5]/15 shadow-lg max-h-80 overflow-y-auto"
                     >
-                        {filteredCourses.length > 0 ? (
-                            filteredCourses.map((course, index) => (
+                        {visibleCourses.length > 0 ? (
+                            <>
+                                {showingSuggestions ? (
+                                    <div className="px-4 pt-3 pb-1 text-[11px] font-semibold uppercase tracking-wide text-black/45 dark:text-[#D5D5D5]/45">
+                                        Popular courses
+                                    </div>
+                                ) : null}
+                                {visibleCourses.map((course, index) => (
                                 <Link
                                     key={course.code}
                                     href={getCoursePastPapersPath(course.code)}
@@ -457,7 +510,8 @@ export default function CourseSearch({ courses }: CourseSearchProps) {
                                         )}
                                     </div>
                                 </Link>
-                            ))
+                                ))}
+                            </>
                         ) : query.trim() ? (
                             <div className="px-4 py-6 text-center text-sm text-black/60 dark:text-[#D5D5D5]/60">
                                 No courses found for &quot;{query}&quot;

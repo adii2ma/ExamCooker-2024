@@ -4,12 +4,12 @@ import Script from "next/script";
 import { Toaster } from "@/app/components/ui/toaster";
 import "@/app/globals.css";
 import UpsellToast from "@/app/components/ui/upsell-toast";
-import UpsellModal from "@/app/components/ui/upsell-modal";
 import PwaServiceWorker from "@/app/components/pwa-service-worker";
+import HydrationRecovery from "@/app/hydration-recovery";
+import { hydrationRecoveryInitScript } from "@/app/hydration-recovery-script";
 import CapacitorBridge from "@/app/components/capacitor-bridge";
 import NativeIosTabSync from "@/app/components/native-ios-tab-sync";
 import AndroidInstallBanner from "@/app/components/android-install-banner";
-import { GoogleAnalytics } from "@next/third-parties/google";
 import type { Metadata, Viewport } from "next";
 import { DEFAULT_KEYWORDS, getBaseUrl } from "@/lib/seo";
 import StructuredData from "@/app/components/seo/structured-data";
@@ -45,8 +45,18 @@ export const metadata: Metadata = {
         title: "ExamCooker",
         statusBarStyle: "black-translucent",
     },
+    // Disable Safari/iOS Data Detectors entirely. When left on, Safari rewrites
+    // matched text (dates, times, addresses, emails, phone numbers) into <a>
+    // wrappers *before* React hydrates, which mutates the server-rendered DOM and
+    // triggers a React #418 hydration mismatch — observed only on Safari/iOS as a
+    // flash of the homepage and resource pages. Turning all detectors off keeps
+    // the pre-hydration markup identical to what the server rendered.
     formatDetection: {
         telephone: false,
+        date: false,
+        address: false,
+        email: false,
+        url: false,
     },
     icons: {
         icon: [
@@ -74,6 +84,23 @@ export const metadata: Metadata = {
     },
 };
 const plus_jakarta_sans = Plus_Jakarta_Sans({ subsets: ["latin"] });
+
+function GoogleAnalytics({ gaId }: { gaId: string }) {
+    return (
+        <>
+            <Script
+                src={`https://www.googletagmanager.com/gtag/js?id=${encodeURIComponent(gaId)}`}
+                strategy="afterInteractive"
+            />
+            <Script id="google-analytics" strategy="afterInteractive">
+                {`window.dataLayer = window.dataLayer || [];
+function gtag(){dataLayer.push(arguments);}
+gtag('js', new Date());
+gtag('config', ${JSON.stringify(gaId)});`}
+            </Script>
+        </>
+    );
+}
 
 export default function RootLayout({
     children,
@@ -109,6 +136,9 @@ export default function RootLayout({
                 <Script id="native-shell-init" strategy="beforeInteractive">
                     {"(function(){try{var c=window.Capacitor;if(!c||typeof c.isNativePlatform!=='function'||!c.isNativePlatform())return;var p=typeof c.getPlatform==='function'?c.getPlatform():'';if(p!=='ios'&&p!=='android')return;var r=document.documentElement;r.dataset.nativePlatform=p;r.toggleAttribute('data-native-ios',p==='ios');r.toggleAttribute('data-native-android',p==='android');r.setAttribute('data-native-tabs-pending','true');r.setAttribute(p==='ios'?'data-native-ios-tabs-pending':'data-native-android-tabs-pending','true');}catch(e){}})();"}
                 </Script>
+                <Script id="hydration-recovery-init" strategy="beforeInteractive">
+                    {hydrationRecoveryInitScript}
+                </Script>
             </head>
             <body
                 className={`${plus_jakarta_sans.className} antialiased bg-[#C2E6EC] dark:bg-[#0C1222]`}
@@ -117,13 +147,11 @@ export default function RootLayout({
                     backgroundColor: "var(--ec-app-bg, #0C1222)",
                 }}
             >
+                <HydrationRecovery />
                 {children}
                 <Toaster />
                 <Suspense fallback={null}>
                     <UpsellToast />
-                </Suspense>
-                <Suspense fallback={null}>
-                    <UpsellModal />
                 </Suspense>
                 <Suspense fallback={null}>
                     <AndroidInstallBanner />

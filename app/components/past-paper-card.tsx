@@ -1,7 +1,7 @@
 "use client";
 import React from "react";
-import Link from "next/link";
 import Image from "@/app/components/common/app-image";
+import IntentPrefetchLink from "@/app/components/common/intent-prefetch-link";
 import { getPastPaperDetailPath } from "@/lib/seo";
 
 interface PastPaperCardProps {
@@ -44,9 +44,8 @@ function PastPaperCard({
 
   return (
     <div className={`max-w-sm w-full h-full text-black dark:text-[#D5D5D5]`}>
-      <Link
+      <IntentPrefetchLink
         href={href}
-        prefetch={index < 3}
         transitionTypes={openInNewTab || transitionTypes === false ? undefined : transitionTypes ?? ["nav-forward"]}
         target={openInNewTab ? "_blank" : undefined}
         className="ec-card-lift ec-press group block max-w-96 cursor-pointer border-2 border-[#5FC4E7] bg-[#5FC4E7] text-center hover:border-b-2 hover:border-b-[#ffffff] dark:border-[#ffffff]/20 dark:bg-[#ffffff]/10 dark:hover:border-b-[#3BF4C7] dark:hover:bg-[#ffffff]/10 lg:dark:bg-[#0C1222]"
@@ -74,7 +73,7 @@ function PastPaperCard({
             priority={index < 3}
           />
         </div>
-      </Link>
+      </IntentPrefetchLink>
     </div>
   );
 }

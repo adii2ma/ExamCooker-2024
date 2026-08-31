@@ -5,10 +5,15 @@ import { notFound, redirect } from "next/navigation";
 import DirectionalTransition from "@/app/components/common/directional-transition";
 import PageBreadcrumbRow from "@/app/components/common/page-breadcrumb-row";
 import CourseNotesGrid from "@/app/components/notes/course-notes-grid";
+import CourseCodeSwitcher from "@/app/components/courses/course-code-switcher";
 import Pagination from "@/app/components/pagination";
+import UploadButtonNotes from "@/app/components/upload-button-notes";
 import CourseVisitTracker from "@/app/components/past_papers/course-visit-tracker";
 import StructuredData from "@/app/components/seo/structured-data";
-import { getCourseDetailByCode } from "@/lib/data/course-catalog";
+import {
+    getCourseDetailByCode,
+    getCourseTitleVariants,
+} from "@/lib/data/course-catalog";
 import {
     getCourseNotesCount,
     getCourseNotesPage,
@@ -141,12 +146,67 @@ async function CourseNotesContent({
         Number.parseInt(rawSearchParams?.page || "1", 10) || 1,
     );
 
-    const [noteCount, subject] = await Promise.all([
+    const [noteCount, subject, courseOptions] = await Promise.all([
         getCourseNotesCount({ courseId: course.courseId }),
         getSubjectByCourseCode(course.code),
+        getCourseTitleVariants(course.title),
     ]);
 
-    if (!noteCount) return notFound();
+    if (!noteCount) {
+        return (
+            <>
+                <CourseVisitTracker code={course.code} context="notes" />
+                <div className="mx-auto flex w-full max-w-7xl flex-col gap-8 px-3 pb-6 pt-4 sm:px-6 sm:py-6 lg:px-10 lg:py-10">
+                    <header className="flex flex-col gap-4">
+                        <PageBreadcrumbRow
+                            items={[
+                                { href: "/notes", label: "Notes" },
+                                { href: getCoursePath(course.code), label: course.code },
+                                { label: `${course.code} notes` },
+                            ]}
+                        />
+                        <div className="max-w-4xl">
+                            <h1 className="text-3xl font-black leading-tight sm:text-4xl lg:text-5xl">
+                                {course.title} notes
+                            </h1>
+                            <div className="mt-3">
+                                <CourseCodeSwitcher
+                                    currentCode={course.code}
+                                    courseTitle={course.title}
+                                    courses={courseOptions}
+                                    surface="notes"
+                                />
+                            </div>
+                        </div>
+                    </header>
+
+                    <div className="flex flex-col items-center gap-5 border-2 border-dashed border-black/30 p-10 text-center dark:border-[#D5D5D5]/30">
+                        <div className="flex max-w-xl flex-col gap-2">
+                            <p className="text-lg font-bold text-black dark:text-[#D5D5D5]">
+                                No notes yet for {course.code}
+                            </p>
+                            <p className="text-sm text-black/70 dark:text-[#D5D5D5]/70">
+                                {course.title} is on ExamCooker, but no one has uploaded
+                                notes for it yet. Be the first to add some.
+                            </p>
+                        </div>
+                        <div className="flex flex-wrap items-center justify-center gap-2">
+                            <UploadButtonNotes />
+                            {subject && (
+                                <Link
+                                    href={getCourseResourcesPath(course.code)}
+                                    transitionTypes={["nav-forward"]}
+                                    className="inline-flex h-12 items-center border-2 border-[#5FC4E7] bg-[#5FC4E7]/40 px-4 text-sm font-semibold transition hover:bg-[#5FC4E7]/60 dark:border-[#ffffff]/20 dark:bg-[#ffffff]/10 dark:text-[#D5D5D5] dark:hover:bg-[#ffffff]/15"
+                                >
+                                    Resources
+                                </Link>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            </>
+        );
+    }
 
     const totalPages = Math.max(1, Math.ceil(noteCount / PAGE_SIZE));
     if (requestedPage > totalPages) {
@@ -240,6 +300,14 @@ async function CourseNotesContent({
                             <h1 className="text-3xl font-black leading-tight sm:text-4xl lg:text-5xl">
                                 {course.title} notes
                             </h1>
+                            <div className="mt-3">
+                                <CourseCodeSwitcher
+                                    currentCode={course.code}
+                                    courseTitle={course.title}
+                                    courses={courseOptions}
+                                    surface="notes"
+                                />
+                            </div>
                             <p className="sr-only">
                                 Download {course.code} lecture notes, study material, revision PDFs,
                                 and prep resources for {course.title}. Use it as the main notes

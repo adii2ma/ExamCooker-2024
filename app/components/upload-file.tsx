@@ -31,6 +31,14 @@ type ProcessedUploadResult = {
     thumbnailUrl: string | null;
     filename: string;
     message: string;
+    receiptId: string;
+};
+
+type UploadProcessResponse = {
+    success: boolean;
+    error?: string;
+    receiptId?: string;
+    result?: Omit<ProcessedUploadResult, "receiptId">;
 };
 
 type UploadSaveResponse = {
@@ -152,57 +160,18 @@ const isImageFile = (file: File) => file.type.startsWith("image/");
 const stripExtension = (filename: string) => filename.replace(/\.[^/.]+$/, "");
 const PROCESSOR_SUCCESS_MESSAGE = "processed successfully";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === "object" && value !== null;
-}
+function getClipboardImageFiles(clipboardData: DataTransfer | null): File[] {
+    if (!clipboardData) return [];
 
-function getStringField(
-    source: Record<string, unknown>,
-    ...keys: string[]
-): string | null {
-    for (const key of keys) {
-        const value = source[key];
-        if (typeof value === "string" && value.trim()) {
-            return value.trim();
-        }
-    }
+    const itemFiles = Array.from(clipboardData.items)
+        .filter((item) => item.kind === "file")
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => file !== null);
+    const files = itemFiles.length > 0
+        ? itemFiles
+        : Array.from(clipboardData.files);
 
-    return null;
-}
-
-function normalizeProcessedUploadResult(
-    payload: unknown,
-    fallbackFilename: string,
-): ProcessedUploadResult {
-    if (!isRecord(payload)) {
-        return {
-            fileUrl: "",
-            thumbnailUrl: null,
-            filename: fallbackFilename,
-            message: "Upload processor returned an invalid response.",
-        };
-    }
-
-    const fileUrl = getStringField(payload, "fileUrl", "file_url", "url") ?? "";
-    const filename =
-        getStringField(payload, "filename", "fileName", "name") ?? fallbackFilename;
-    const message =
-        getStringField(payload, "message") ??
-        (fileUrl
-            ? PROCESSOR_SUCCESS_MESSAGE
-            : "Upload processor did not return a file URL.");
-
-    return {
-        fileUrl,
-        filename,
-        message,
-        thumbnailUrl: getStringField(
-            payload,
-            "thumbnailUrl",
-            "thumbnail_url",
-            "thumbNailUrl",
-        ),
-    };
+    return files.filter(isImageFile);
 }
 
 function uploadFormReducer(
@@ -280,7 +249,7 @@ function UploadTitleField({
             className="w-full border-2 border-dashed border-gray-300 p-2 text-sm font-bold text-black dark:bg-[#0C1222] dark:text-[#D5D5D5] sm:text-base"
             value={value}
             onChange={(event) => onChange(index, event.target.value)}
-            required
+            placeholder="Title (optional)"
         />
     );
 }
@@ -288,16 +257,22 @@ function UploadTitleField({
 function CourseField({
     courseId,
     courses,
+    required = true,
     updateField,
 }: {
     courseId: string | null;
     courses: CourseOption[];
+    required?: boolean;
     updateField: UploadFieldChange;
 }) {
     return (
         <div>
             <p className="mb-1 block text-xs font-semibold uppercase tracking-wider text-black/60 dark:text-[#D5D5D5]/60">
-                Course <span className="text-red-500">*</span>
+                Course{required ? (
+                    <span className="text-red-500"> *</span>
+                ) : (
+                    <span className="font-normal normal-case tracking-normal"> · optional</span>
+                )}
             </p>
             <CoursePicker
                 courses={courses}
@@ -335,7 +310,7 @@ function PastPaperMetadataFields({
                         htmlFor={ids.examTypeId}
                         className="mb-1 block text-xs font-semibold uppercase tracking-wider text-black/60 dark:text-[#D5D5D5]/60"
                     >
-                        Exam type <span className="text-red-500">*</span>
+                        Exam type
                     </label>
                     <select
                         id={ids.examTypeId}
@@ -380,7 +355,7 @@ function PastPaperMetadataFields({
                         htmlFor={ids.yearId}
                         className="mb-1 block text-xs font-semibold uppercase tracking-wider text-black/60 dark:text-[#D5D5D5]/60"
                     >
-                        Year <span className="text-red-500">*</span>
+                        Year
                     </label>
                     <select
                         id={ids.yearId}
@@ -769,6 +744,7 @@ function useUploadFileController({ variant, courses }: UploadFileProps) {
     );
     const [pending, startTransition] = useTransition();
     const cameraInputRef = useRef<HTMLInputElement | null>(null);
+    const imageConversionInFlightRef = useRef(false);
     const fieldId = useId();
 
     const ids: UploadFieldIds = {
@@ -812,8 +788,8 @@ function useUploadFileController({ variant, courses }: UploadFileProps) {
 
     const imagePreviewUrls = useMemo(
         () =>
-            imageBundleFiles.map((file) => ({
-                key: `${file.name}-${file.lastModified}-${file.size}`,
+            imageBundleFiles.map((file, index) => ({
+                key: `${file.name}-${file.lastModified}-${file.size}-${index}`,
                 url: URL.createObjectURL(file),
             })),
         [imageBundleFiles],
@@ -907,6 +883,10 @@ function useUploadFileController({ variant, courses }: UploadFileProps) {
             }
 
             if (variant === "Past Papers" && imageFiles.length) {
+                if (imageConversionInFlightRef.current) {
+                    toast({ title: "Wait for the current pages to finish processing." });
+                    return;
+                }
                 if (files.length > 0 && !isImageBundleMode) {
                     toast({
                         title: "Remove the existing PDF before adding images",
@@ -915,6 +895,7 @@ function useUploadFileController({ variant, courses }: UploadFileProps) {
                     return;
                 }
 
+                imageConversionInFlightRef.current = true;
                 dispatch({ type: "patch", payload: { isConverting: true } });
 
                 try {
@@ -940,6 +921,7 @@ function useUploadFileController({ variant, courses }: UploadFileProps) {
                         variant: "destructive",
                     });
                 } finally {
+                    imageConversionInFlightRef.current = false;
                     dispatch({ type: "patch", payload: { isConverting: false } });
                 }
                 return;
@@ -992,6 +974,9 @@ function useUploadFileController({ variant, courses }: UploadFileProps) {
         },
         onDragEnter: () => updateField("isDragging", true),
         onDragLeave: () => updateField("isDragging", false),
+        // Clipboard images are handled at the document level below so paste
+        // keeps working after the initial dropzone is replaced by the bundle UI.
+        noPaste: true,
         multiple: variant !== "Past Papers",
         maxFiles: variant === "Past Papers" ? 1 : undefined,
         accept:
@@ -1004,6 +989,25 @@ function useUploadFileController({ variant, courses }: UploadFileProps) {
                     "application/pdf": [".pdf"],
                 },
     });
+
+    useEffect(() => {
+        if (variant !== "Past Papers") return;
+
+        const handleClipboardPaste = (event: ClipboardEvent) => {
+            const pastedImages = getClipboardImageFiles(event.clipboardData);
+            if (pastedImages.length === 0) return;
+
+            event.preventDefault();
+            if (isConverting) {
+                toast({ title: "Wait for the current pages to finish processing." });
+                return;
+            }
+            void addFiles(pastedImages);
+        };
+
+        document.addEventListener("paste", handleClipboardPaste);
+        return () => document.removeEventListener("paste", handleClipboardPaste);
+    }, [addFiles, isConverting, toast, variant]);
 
     const handleTitleChange = useCallback((index: number, value: string) => {
         dispatch({ type: "update_title", index, value });
@@ -1051,7 +1055,7 @@ function useUploadFileController({ variant, courses }: UploadFileProps) {
                 return;
             }
 
-            if (courses?.length && !courseId) {
+            if (variant === "Notes" && courses?.length && !courseId) {
                 dispatch({
                     type: "patch",
                     payload: { error: "Please select a course." },
@@ -1059,62 +1063,39 @@ function useUploadFileController({ variant, courses }: UploadFileProps) {
                 return;
             }
 
-            if (variant === "Past Papers" && courses?.length) {
-                if (!examType) {
-                    dispatch({
-                        type: "patch",
-                        payload: { error: "Please select an exam type." },
-                    });
-                    return;
-                }
-                if (!year) {
-                    dispatch({
-                        type: "patch",
-                        payload: { error: "Please select a year." },
-                    });
-                    return;
-                }
-            }
-
             startTransition(async () => {
                 try {
-                    const processorBaseUrl =
-                        process.env.NEXT_PUBLIC_MICROSERVICE_URL?.replace(/\/$/, "");
-                    if (!processorBaseUrl) {
-                        throw new Error("Upload processor URL is not configured.");
-                    }
-
                     const formDatas = files.map((file, index) => {
                         const formData = new FormData();
                         formData.append("file", file);
-                        formData.append("filetitle", fileTitles[index]);
+                        formData.append(
+                            "filetitle",
+                            fileTitles[index]?.trim() || stripExtension(file.name),
+                        );
                         return formData;
                     });
 
                     const promises = formDatas.map(async (formData) => {
                         const response = await fetch(
-                            `${processorBaseUrl}/process_pdf`,
+                            "/api/uploads/process",
                             {
                                 method: "POST",
                                 body: formData,
                             },
                         );
 
-                        if (!response.ok) {
-                            const errorText = await response.text().catch(() => "");
-                            const details = errorText
-                                ? `: ${errorText.slice(0, 240)}`
-                                : "";
-                            throw new Error(
-                                `Failed to upload file ${formData.get("filetitle")}${details}`,
-                            );
+                        const payload = (await response
+                            .json()
+                            .catch(() => null)) as UploadProcessResponse | null;
+                        if (
+                            !response.ok ||
+                            !payload?.success ||
+                            !payload.receiptId ||
+                            !payload.result
+                        ) {
+                            throw new Error(payload?.error ?? "Upload processing failed.");
                         }
-
-                        const payload = await response.json();
-                        return normalizeProcessedUploadResult(
-                            payload,
-                            String(formData.get("filetitle") ?? "Untitled"),
-                        );
+                        return { ...payload.result, receiptId: payload.receiptId };
                     });
 
                     const results = await Promise.all(promises);
@@ -1259,6 +1240,7 @@ function UploadFile({ variant, courses }: UploadFileProps) {
                         <CourseField
                             courseId={courseId}
                             courses={courses}
+                            required={variant === "Notes"}
                             updateField={updateField}
                         />
                     ) : null}

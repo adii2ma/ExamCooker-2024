@@ -4,11 +4,13 @@ import type {
   NextApiResponse,
 } from "next";
 import { after } from "next/server";
+import { cookies } from "next/headers";
 import { cache } from "react";
 import { createHash, timingSafeEqual } from "node:crypto";
 import NextAuth from "next-auth";
 import type { Session } from "next-auth";
 import { getServerSession } from "next-auth/next";
+import { decode, type JWT } from "next-auth/jwt";
 import Apple from "next-auth/providers/apple";
 import Credentials from "next-auth/providers/credentials";
 import Google from "next-auth/providers/google";
@@ -22,6 +24,7 @@ import { createPostHogServer } from "@/lib/posthog-server";
 
 const adapter = createAuthAdapter();
 const ROLE_REFRESH_INTERVAL_SECONDS = 5 * 60;
+const DELETED_ACCOUNT_EMAIL_DOMAIN = "@deleted.examcooker.local";
 const useSecureAuthCookies =
   (process.env.NEXTAUTH_URL ?? process.env.NEXT_PUBLIC_BASE_URL ?? "").startsWith(
     "https://",
@@ -53,6 +56,17 @@ type SessionCallbackParams = {
   session: Session;
   token: AuthToken;
 };
+
+class DeletedAccountSessionError extends Error {
+  constructor() {
+    super("Session user has been deleted");
+    this.name = "DeletedAccountSessionError";
+  }
+}
+
+function isDeletedAccountEmail(email: string | null | undefined) {
+  return email?.endsWith(DELETED_ACCOUNT_EMAIL_DOMAIN) ?? false;
+}
 
 function requiredEnv(name: "AUTH_GOOGLE_ID" | "AUTH_GOOGLE_SECRET") {
   const value = process.env[name];
@@ -88,7 +102,17 @@ function getReviewRole(): AppRole {
     optionalReviewEnv("APP_REVIEW_ROLE") ??
     optionalReviewEnv("EXAMCOOKER_REVIEW_ROLE");
 
+  // Review credentials are least-privileged unless moderation access is
+  // explicitly enabled for the deployment.
   return role === "MODERATOR" ? "MODERATOR" : "USER";
+}
+
+function isConfiguredReviewEmail(email: string | null | undefined) {
+  if (!email) return false;
+  const configuredEmail =
+    optionalReviewEnv("APP_REVIEW_EMAIL") ??
+    optionalReviewEnv("EXAMCOOKER_REVIEW_EMAIL");
+  return configuredEmail?.toLowerCase() === email.toLowerCase();
 }
 
 function getReviewCredentials() {
@@ -452,22 +476,36 @@ export const authConfig = {
         return token;
       }
 
-      const lastSyncedAt = Number(token.roleSyncedAt ?? 0);
       const userId = typeof token.id === "string" ? token.id : null;
-      if (
-        userId &&
-        (!lastSyncedAt || now - lastSyncedAt > ROLE_REFRESH_INTERVAL_SECONDS)
-      ) {
+      if (userId) {
+        const lastSyncedAt = Number(token.roleSyncedAt ?? 0);
+        const shouldRefreshRole =
+          !lastSyncedAt || now - lastSyncedAt > ROLE_REFRESH_INTERVAL_SECONDS;
+
         try {
           const dbUsers = await db
-            .select({ role: userTable.role })
+            .select({ email: userTable.email, role: userTable.role })
             .from(userTable)
             .where(eq(userTable.id, userId));
           const dbUser = dbUsers[0] ?? null;
 
-          if (dbUser?.role) token.role = dbUser.role;
-          token.roleSyncedAt = now;
+          if (!dbUser || isDeletedAccountEmail(dbUser.email)) {
+            throw new DeletedAccountSessionError();
+          }
+
+          if (isConfiguredReviewEmail(dbUser.email)) {
+            // Existing QA sessions should gain (or lose, when explicitly
+            // configured as USER) review access without requiring a sign-out.
+            token.role = getReviewRole();
+            token.roleSyncedAt = now;
+          } else if (shouldRefreshRole) {
+            if (dbUser.role) token.role = dbUser.role;
+            token.roleSyncedAt = now;
+          }
         } catch (error) {
+          if (error instanceof DeletedAccountSessionError) {
+            throw error;
+          }
           console.error("[auth] role refresh failed", error);
         }
       }
@@ -530,7 +568,100 @@ export const authConfig = {
 
 export const authHandler = NextAuth(authConfig);
 
-const getCachedServerSession = cache(() => getServerSession(authConfig));
+const configuredSessionCookieName = `${secureCookiePrefix}next-auth.session-token`;
+const sessionCookieNames = [
+  configuredSessionCookieName,
+  configuredSessionCookieName.startsWith("__Secure-")
+    ? "next-auth.session-token"
+    : "__Secure-next-auth.session-token",
+];
+
+function sessionCookieChunkIndex(name: string, sessionCookieName: string) {
+  if (name === sessionCookieName) return 0;
+  const index = Number.parseInt(name.slice(sessionCookieName.length + 1), 10);
+  return Number.isFinite(index) ? index : Number.MAX_SAFE_INTEGER;
+}
+
+async function readRequestSession(): Promise<Session | null> {
+  const cookieStore = await cookies();
+  const secret = process.env.AUTH_SECRET ?? process.env.NEXTAUTH_SECRET;
+  if (!secret) return null;
+
+  let token: JWT | null = null;
+  let userId: string | null = null;
+  for (const sessionCookieName of sessionCookieNames) {
+    const sessionToken = cookieStore
+      .getAll()
+      .filter(({ name }) =>
+        name === sessionCookieName || name.startsWith(`${sessionCookieName}.`),
+      )
+      .sort(
+        (left, right) =>
+          sessionCookieChunkIndex(left.name, sessionCookieName) -
+          sessionCookieChunkIndex(right.name, sessionCookieName),
+      )
+      .map(({ value }) => value)
+      .join("");
+    if (!sessionToken) continue;
+
+    try {
+      const candidate = await decode({ token: sessionToken, secret });
+      const candidateUserId =
+        typeof candidate?.id === "string"
+          ? candidate.id
+          : typeof candidate?.sub === "string"
+            ? candidate.sub
+            : null;
+      if (candidate && candidateUserId) {
+        token = candidate;
+        userId = candidateUserId;
+        break;
+      }
+    } catch {
+      continue;
+    }
+  }
+  if (!token || !userId) return null;
+
+  try {
+    const [dbUser] = await db
+      .select({
+        email: userTable.email,
+        image: userTable.image,
+        name: userTable.name,
+        role: userTable.role,
+      })
+      .from(userTable)
+      .where(eq(userTable.id, userId))
+      .limit(1);
+    if (!dbUser || isDeletedAccountEmail(dbUser.email)) return null;
+
+    const role = isConfiguredReviewEmail(dbUser.email)
+      ? getReviewRole()
+      : dbUser.role === "MODERATOR"
+        ? "MODERATOR"
+        : "USER";
+    const expires =
+      typeof token.exp === "number"
+        ? new Date(token.exp * 1000).toISOString()
+        : new Date(0).toISOString();
+
+    return {
+      user: {
+        id: userId,
+        email: dbUser.email,
+        image: dbUser.image,
+        name: dbUser.name,
+        role,
+      },
+      expires,
+    };
+  } catch {
+    return null;
+  }
+}
+
+const getCachedRequestSession = cache(readRequestSession);
 
 export function auth(
   ...args:
@@ -539,7 +670,7 @@ export function auth(
     | []
 ) {
   if (args.length === 0) {
-    return getCachedServerSession();
+    return getCachedRequestSession();
   }
 
   return getServerSession(...args, authConfig);

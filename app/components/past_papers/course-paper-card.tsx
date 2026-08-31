@@ -1,8 +1,8 @@
 "use client";
 
 import React, { memo, useCallback, useRef } from "react";
-import Link from "next/link";
 import Image from "@/app/components/common/app-image";
+import IntentPrefetchLink from "@/app/components/common/intent-prefetch-link";
 import {
     Check,
     Download,
@@ -15,6 +15,7 @@ import { buildPastPaperPdfFileName } from "@/lib/downloads/resource-names";
 import { preloadPdfBuffer } from "@/lib/pdf/pdf-buffer-cache";
 import { preloadPdfiumEngine } from "@/lib/pdf/pdfium-engine-cache";
 import type { ExamType } from "@/db";
+import type { PdfPageEdits } from "@/lib/pdf/page-edits";
 
 type Paper = {
     id: string;
@@ -25,12 +26,14 @@ type Paper = {
     slot: string | null;
     year: number | null;
     hasAnswerKey: boolean;
+    pageEdits: PdfPageEdits | null;
 };
 
 type Props = {
     paper: Paper;
     courseCode: string;
     courseTitle: string;
+    href: string;
     index: number;
     selected: boolean;
     onToggleSelect: (id: string) => void;
@@ -46,6 +49,7 @@ function CoursePaperCard({
     paper,
     courseCode,
     courseTitle,
+    href,
     index,
     selected,
     onToggleSelect,
@@ -56,7 +60,6 @@ function CoursePaperCard({
     onSplitDragCancel,
     onContextMenuOpen,
 }: Props) {
-    const href = `/past_papers/${encodeURIComponent(courseCode)}/paper/${paper.id}`;
     const hasWarmedPdf = useRef(false);
     const splitDragRef = useRef<{
         pointerId: number;
@@ -117,6 +120,7 @@ function CoursePaperCard({
                 year: paper.year,
                 hasAnswerKey: paper.hasAnswerKey,
             }),
+            pageEdits: paper.pageEdits,
         });
     }, [courseCode, courseTitle, paper]);
 
@@ -232,17 +236,14 @@ function CoursePaperCard({
 
     return (
         <article
-            className={`ec-card-lift ec-press group relative isolate flex h-full flex-col border-2 p-3 text-black focus-within:outline-none focus-within:ring-2 focus-within:ring-black/70 dark:text-[#D5D5D5] dark:focus-within:ring-[#3BF4C7] ${
-                splitDragEnabled ? "[touch-action:pan-y]" : ""
-            } ${selected
+            className={`ec-card-lift ec-press group relative isolate flex h-full flex-col border-2 p-3 text-black [touch-action:pan-y] focus-within:outline-none focus-within:ring-2 focus-within:ring-black/70 dark:text-[#D5D5D5] dark:focus-within:ring-[#3BF4C7] ${selected
                     ? "border-black bg-[#5FC4E7] shadow-[4px_4px_0_0_rgba(0,0,0,1)] dark:border-[#3BF4C7] dark:bg-[#0C1222] dark:shadow-[4px_4px_0_0_rgba(59,244,199,0.35)]"
                     : "border-[#5FC4E7] bg-[#5FC4E7] hover:border-b-2 hover:border-b-white dark:border-[#ffffff]/20 dark:bg-[#ffffff]/10 dark:lg:bg-[#0C1222] dark:hover:border-b-[#3BF4C7] dark:hover:bg-[#ffffff]/10"
                 }`}
         >
-            <Link
+            <IntentPrefetchLink
                 href={href}
                 draggable={false}
-                prefetch={index < 3}
                 transitionTypes={["nav-forward"]}
                 aria-label={linkAriaLabel}
                 onClickCapture={handleClickCapture}
@@ -257,7 +258,7 @@ function CoursePaperCard({
                 className="absolute inset-0 z-0"
             >
                 <span className="sr-only">{linkAriaLabel}</span>
-            </Link>
+            </IntentPrefetchLink>
 
             <div className="pointer-events-none flex h-full flex-col">
                 <div className="flex flex-col gap-1.5 pb-2 pr-6 text-black dark:text-[#D5D5D5]">

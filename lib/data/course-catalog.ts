@@ -1,6 +1,7 @@
 import { cacheLife, cacheTag } from "next/cache";
-import Fuse from "fuse.js";
 import { cache } from "react";
+import { getAliasCourseCodes } from "@/lib/course-aliases";
+import { createCourseFuse } from "@/lib/course-search-fuse";
 import {
     and,
     count,
@@ -76,6 +77,19 @@ export type CourseSearchRecord = {
     aliases: string[];
 };
 
+export type CourseTitleVariant = Pick<
+    CourseSearchRecord,
+    "id" | "code" | "title" | "paperCount" | "noteCount"
+>;
+
+function normalizeCourseTitle(title: string) {
+    return title
+        .normalize("NFKC")
+        .trim()
+        .replace(/\s+/g, " ")
+        .toLocaleLowerCase("en");
+}
+
 async function getSyllabusIdByCourseCode() {
     "use cache";
     cacheTag("syllabus");
@@ -98,6 +112,51 @@ async function getSyllabusIdByCourseCode() {
     }
 
     return syllabusIdByCode;
+}
+
+// Words that never contribute a meaningful initial to a derived acronym.
+const ACRONYM_STOPWORDS = new Set([
+    "and",
+    "of",
+    "the",
+    "for",
+    "to",
+    "in",
+    "on",
+    "a",
+    "an",
+    "with",
+    "using",
+    "its",
+    "or",
+    "de",
+    "&",
+]);
+const ROMAN_NUMERAL = /^[ivx]+$/i;
+
+// Derive a search acronym from a course title's significant-word initials so
+// codes like "NLP" (Natural Language Processing) resolve without anyone
+// remembering to add a hand-maintained COURSE_ACRONYMS entry. Returns null when
+// the title is too short (or too long) to make a useful acronym. Merged into
+// each course's aliases below so both the server-side search
+// (`searchCourseGrid`) and the client dropdown's Fuse index match on it.
+function deriveCourseAcronym(title: string): string | null {
+    const words = title
+        .split(/[^\p{L}\p{N}]+/u)
+        .filter(Boolean)
+        .filter((word) => {
+            const lower = word.toLowerCase();
+            if (ACRONYM_STOPWORDS.has(lower)) return false;
+            if (word.length <= 3 && ROMAN_NUMERAL.test(word)) return false;
+            if (/^\d+$/.test(word)) return false;
+            return true;
+        });
+
+    if (words.length < 3 || words.length > 6) return null;
+
+    const acronym = words.map((word) => word[0]).join("").toUpperCase();
+    if (acronym.length < 3 || acronym.length > 6) return null;
+    return acronym;
 }
 
 async function getCourseCatalogRows(): Promise<CourseCatalogRow[]> {
@@ -148,14 +207,24 @@ async function getCourseCatalogRows(): Promise<CourseCatalogRow[]> {
                     .map((row) => [row.courseId, row.paperCount]),
             );
 
-            return courses.map((courseRow) => ({
-                id: courseRow.id,
-                code: courseRow.code,
-                title: courseRow.title,
-                aliases: courseRow.aliases ?? [],
-                paperCount: paperCountByCourseId.get(courseRow.id) ?? 0,
-                noteCount: noteCountByCourseId.get(courseRow.id) ?? 0,
-            }));
+            return courses.map((courseRow) => {
+                const baseAliases = courseRow.aliases ?? [];
+                const acronym = deriveCourseAcronym(courseRow.title);
+                const aliases =
+                    acronym &&
+                    !baseAliases.some((a) => a.toUpperCase() === acronym)
+                        ? [...baseAliases, acronym]
+                        : baseAliases;
+
+                return {
+                    id: courseRow.id,
+                    code: courseRow.code,
+                    title: courseRow.title,
+                    aliases,
+                    paperCount: paperCountByCourseId.get(courseRow.id) ?? 0,
+                    noteCount: noteCountByCourseId.get(courseRow.id) ?? 0,
+                };
+            });
         },
     );
 }
@@ -179,6 +248,36 @@ export async function getCourseSearchRecords(): Promise<CourseSearchRecord[]> {
         }));
 }
 
+// Ungated course list for past-papers *search* (the dropdown + free-text
+// results grid). Mirrors the homepage's `getSearchableCourses`: browsing grids
+// stay gated to courses that already have content, but search must reach every
+// real course so acronyms and partial codes for content-less courses ("BCE",
+// "NLP") resolve to the course page instead of dead-ending on an empty results
+// page. Ranked content-first so richer courses lead the matches.
+export async function getSearchableCourseRecords(): Promise<CourseSearchRecord[]> {
+    "use cache";
+    cacheTag("courses", "notes", "past_papers");
+    cacheLife({ stale: 60, revalidate: 300, expire: 3600 });
+
+    const courses = await getCourseCatalogRows();
+
+    return courses
+        .map((courseRow) => ({
+            id: courseRow.id,
+            code: courseRow.code,
+            title: courseRow.title,
+            paperCount: courseRow.paperCount,
+            noteCount: courseRow.noteCount,
+            aliases: courseRow.aliases,
+        }))
+        .sort(
+            (a, b) =>
+                b.paperCount - a.paperCount ||
+                b.noteCount - a.noteCount ||
+                a.title.localeCompare(b.title, "en", { sensitivity: "base" }),
+        );
+}
+
 export async function getCoursePickerRecords(): Promise<CourseSearchRecord[]> {
     "use cache";
     cacheTag("courses", "notes", "past_papers");
@@ -198,19 +297,45 @@ export async function getCoursePickerRecords(): Promise<CourseSearchRecord[]> {
         .sort((a, b) => a.code.localeCompare(b.code));
 }
 
-const getCourseSearchIndex = cache(async () => {
-    const records = await getCourseSearchRecords();
+/**
+ * Returns every course code that shares this course's displayed title.
+ * Case and incidental whitespace are ignored so catalog capitalization does
+ * not split otherwise identical courses into separate groups.
+ */
+export async function getCourseTitleVariants(
+    title: string,
+): Promise<CourseTitleVariant[]> {
+    "use cache";
+    cacheTag("courses", "notes", "past_papers");
+    cacheLife({ stale: 60, revalidate: 300, expire: 3600 });
 
-    return new Fuse(records, {
-        keys: [
-            { name: "title", weight: 0.6 },
-            { name: "code", weight: 0.3 },
-            { name: "aliases", weight: 0.1 },
-        ],
-        threshold: 0.3,
-        ignoreLocation: true,
-        minMatchCharLength: 3,
-    });
+    const titleKey = normalizeCourseTitle(title);
+    if (!titleKey) return [];
+
+    const courses = await getCourseCatalogRows();
+    return courses
+        .filter((courseRow) => normalizeCourseTitle(courseRow.title) === titleKey)
+        .map(({ id, code, title: courseTitle, paperCount, noteCount }) => ({
+            id,
+            code,
+            title: courseTitle,
+            paperCount,
+            noteCount,
+        }))
+        .sort(
+            (a, b) =>
+                b.paperCount - a.paperCount ||
+                b.noteCount - a.noteCount ||
+                a.code.localeCompare(b.code, "en", { sensitivity: "base" }),
+        );
+}
+
+const getCourseSearchIndex = cache(async () => {
+    // Ungated so the fuzzy fallback can still reach content-less courses that the
+    // exact / prefix / substring passes missed.
+    const records = await getSearchableCourseRecords();
+
+    return createCourseFuse(records);
 });
 
 export async function getCourseGrid(): Promise<CourseGridItem[]> {
@@ -334,7 +459,9 @@ export async function getPopularCourseGrid(limit = 6): Promise<CourseGridItem[]>
 }
 
 export async function searchCourseGrid(query: string): Promise<CourseGridItem[]> {
-    const records = await getCourseSearchRecords();
+    // Search the full catalog, not just courses that already have content, so a
+    // real but empty course still surfaces (its page handles the empty state).
+    const records = await getSearchableCourseRecords();
     const grid = records.map(({ aliases: _aliases, ...courseRow }) => ({
         ...courseRow,
         viewCount: 0,
@@ -342,10 +469,24 @@ export async function searchCourseGrid(query: string): Promise<CourseGridItem[]>
     const trimmed = query.trim();
     if (!trimmed) return grid;
 
-    // Exact + prefix code match first.
+    // Exact code and shared acronym/alias matches first so free-text submissions
+    // return the same courses that the client-side dropdown previews.
     const upperQuery = normalizeCourseCode(trimmed);
-    const exact = grid.filter((c) => c.code === upperQuery);
-    if (exact.length) return exact;
+    const aliasCodes = new Set(getAliasCourseCodes(trimmed));
+    const exact = records.filter(
+        (courseRow) =>
+            courseRow.code === upperQuery ||
+            aliasCodes.has(courseRow.code) ||
+            courseRow.aliases.some(
+                (alias) => normalizeCourseCode(alias) === upperQuery,
+            ),
+    );
+    if (exact.length) {
+        return exact.map(({ aliases: _aliases, ...courseRow }) => ({
+            ...courseRow,
+            viewCount: 0,
+        }));
+    }
 
     const prefix = grid.filter((c) => c.code.startsWith(upperQuery));
     if (prefix.length > 0 && prefix.length <= 50) {
@@ -392,8 +533,13 @@ export async function getSearchableCourses(): Promise<SearchableCourseRecord[]> 
     cacheTag("courses", "notes", "past_papers", "syllabus");
     cacheLife({ stale: 60, revalidate: 300, expire: 3600 });
 
+    // Search the full course catalog, not just courses that already have
+    // content. Gating this list to courses with papers/notes/syllabus made real
+    // but empty courses invisible from the homepage, so searching for them
+    // dead-ended on "No courses found". Content-rich courses still rank first
+    // (below), and their destination pages handle the empty state gracefully.
     const [courses, syllabusIdByCode] = await Promise.all([
-        getCourseSearchRecords(),
+        getCourseCatalogRows(),
         getSyllabusIdByCourseCode(),
     ]);
 
@@ -407,8 +553,12 @@ export async function getSearchableCourses(): Promise<SearchableCourseRecord[]> 
             noteCount: c.noteCount,
             syllabusId: syllabusIdByCode[c.code] ?? null,
         }))
-        .filter((c) => c.paperCount > 0 || c.noteCount > 0 || c.syllabusId)
-        .sort((a, b) => b.paperCount - a.paperCount);
+        .sort(
+            (a, b) =>
+                b.paperCount - a.paperCount ||
+                b.noteCount - a.noteCount ||
+                a.title.localeCompare(b.title, "en", { sensitivity: "base" }),
+        );
 }
 
 export async function getCatalogStats(): Promise<CatalogStats> {
